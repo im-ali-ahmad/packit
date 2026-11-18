@@ -4,7 +4,7 @@ pub enum InitializeType {
     TARREMOTE,
 }
 
-pub fn initialize(init_type: InitializeType, _url: String) -> i32 {
+pub fn initialize(init_type: InitializeType, url: String) -> i32 {
     match init_type {
         InitializeType::PROJECTLOCAL => {}
         InitializeType::TARLOCAL => {}
