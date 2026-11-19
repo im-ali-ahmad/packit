@@ -1,8 +1,13 @@
+use flate2::{Compression, write::GzEncoder};
 use serde::Deserialize;
 use std::{
-    fs,
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
 };
+
+use crate::{installer_manifest, utils::hash_directory};
+use tar::Builder;
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -71,7 +76,101 @@ fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn pack_folder(src: &Path, manifest: &Manifest) -> i32 {
+fn pack_folder(src: &Path, manifest: &Manifest, out_path: &PathBuf) -> i32 {
+    let mut success: bool = true;
+    let manifest_file: PathBuf = out_path.join("packit-manifest.toml");
+
+    let mut commands: Vec<installer_manifest::Command> = Vec::new();
+    for command in &manifest.commands {
+        let command_path: PathBuf = src.join(&command.file);
+        if !command_path.exists() {
+            println!(
+                "Command file '{}' does not exist.",
+                command_path.to_string_lossy()
+            );
+
+            success = false;
+            break;
+        }
+
+        commands.push(installer_manifest::Command {
+            file: command.file.clone(),
+            name: command.name.clone(),
+        });
+    }
+
+    let install_manifest = installer_manifest::Manifest {
+        commands,
+        project: installer_manifest::Project {
+            uid: manifest.project.uid.clone(),
+            name: manifest.project.name.clone(),
+            description: manifest.project.description.clone(),
+            author: manifest.project.author.clone(),
+            version: manifest.project.version.clone(),
+            license: manifest.project.license.clone(),
+        },
+        hash: if let Ok(h) = hash_directory(src) {
+            h
+        } else {
+            println!("Cannot compute hash of the folder.");
+            success = false;
+            String::new()
+        },
+    };
+
+    let serialized = match toml::to_string(&install_manifest) {
+        Ok(data) => data,
+        Err(e) => {
+            println!("Cannot serialize manifest: {}", e);
+            success = false;
+            String::new()
+        }
+    };
+
+    if success {
+        if let Err(e) =
+            File::create(&manifest_file).and_then(|mut file| file.write_all(serialized.as_bytes()))
+        {
+            println!("Cannot write manifest file: {}", e);
+            success = false;
+        }
+    }
+
+    if !success {
+        return 1;
+    }
+
+    let pack_path: File = if let Ok(p) = File::create(format!(
+        "{}-{}.pack",
+        manifest.project.uid, manifest.project.version
+    )) {
+        p
+    } else {
+        println!("Cannot create output file.");
+        return 1;
+    };
+
+    let encoder: GzEncoder<File> = GzEncoder::new(pack_path, Compression::default());
+    let archive: Builder<GzEncoder<File>> = Builder::new(encoder);
+    let encoder: GzEncoder<File> = if let Ok(e) = archive.into_inner() {
+        e
+    } else {
+        println!("Cannot create archive.");
+        return 1;
+    };
+
+    match encoder.finish() {
+        Ok(_) => {}
+        Err(_) => {
+            println!("Cannot finish archive.");
+            return 1;
+        }
+    };
+
+    println!(
+        "Project packed successfully. Output file: '{}-{}.pack'",
+        manifest.project.uid, manifest.project.version
+    );
     return 0;
 }
 
@@ -197,7 +296,7 @@ fn build_project_local(manifest: &Manifest, cwd: String) -> i32 {
             out_path.to_string_lossy()
         );
 
-        return pack_folder(&out_path, manifest);
+        return pack_folder(&out_path, manifest, &out_path);
     }
 
     println!("No files specified in the manifest.");

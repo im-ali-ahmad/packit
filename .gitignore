@@ -4,3 +4,5 @@ packit.out/
 
 Cargo.lock
 packit-config.toml
+
+*.pack

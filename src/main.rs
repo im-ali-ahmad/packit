@@ -4,6 +4,9 @@ mod initializer;
 mod installer;
 mod remover;
 
+mod installer_manifest;
+mod utils;
+
 use std::{env::args, process::exit};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
