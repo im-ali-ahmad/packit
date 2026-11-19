@@ -1,15 +1,16 @@
-use flate2::{Compression, write::GzEncoder};
+use crate::{installer_manifest, utils::hash_directory};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use reqwest::blocking::Response;
 use serde::Deserialize;
 use std::{
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
 };
+use tar::{Archive, Builder};
+use tempfile::TempDir;
 
-use crate::{installer_manifest, utils::hash_directory};
-use tar::Builder;
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Manifest {
     r#type: String,
     path: String,
@@ -18,25 +19,25 @@ struct Manifest {
     project: Project,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Files {
     base: String,
     extra: Vec<ExtraFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ExtraFile {
     source: String,
     dest: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Command {
     file: String,
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Project {
     uid: String,
     name: String,
@@ -304,11 +305,107 @@ fn build_project_local(manifest: &Manifest, cwd: String) -> i32 {
 }
 
 fn build_tar_local(manifest: &Manifest) -> i32 {
-    0
+    println!("Extracting local archive: '{}'", manifest.path);
+
+    let archive_file: File = match File::open(&manifest.path) {
+        Ok(file) => file,
+        Err(e) => {
+            println!("Cannot open archive: {}", e);
+            return 1;
+        }
+    };
+
+    let temp_dir: TempDir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            println!("Cannot create temporary directory: {}", e);
+            return 1;
+        }
+    };
+
+    let decoder: GzDecoder<File> = GzDecoder::new(archive_file);
+    let mut archive: Archive<GzDecoder<File>> = Archive::new(decoder);
+
+    if let Err(e) = archive.unpack(temp_dir.path()) {
+        println!("Cannot extract archive: {}", e);
+        return 1;
+    }
+
+    println!("Archive extracted successfully.");
+    let mut local_manifest: Manifest = manifest.clone();
+
+    local_manifest.r#type = "PROJECTLOCAL".to_string();
+    local_manifest.path = ".".to_string();
+
+    let cwd: String = temp_dir.path().to_string_lossy().into_owned();
+    let result: i32 = build_project_local(&local_manifest, cwd);
+
+    if result != 0 {
+        println!("Local archive build failed.");
+        return result;
+    }
+
+    println!("Local archive build completed successfully.");
+    return 0;
 }
 
 fn build_tar_remote(manifest: &Manifest) -> i32 {
-    0
+    let url: &String = &manifest.path;
+    println!("Downloading remote archive: '{}'", url);
+
+    let response: Response = match reqwest::blocking::get(url) {
+        Ok(response) => response,
+        Err(e) => {
+            println!("Cannot download remote archive: {}", e);
+            return 1;
+        }
+    };
+
+    if !response.status().is_success() {
+        println!("Remote server returned HTTP status: {}", response.status());
+        return 1;
+    }
+
+    let temp_dir: TempDir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            println!("Cannot create temporary directory: {}", e);
+            return 1;
+        }
+    };
+
+    let archive_path: PathBuf = temp_dir.path().join("remote.tar.gz");
+    let mut archive_file: File = match File::create(&archive_path) {
+        Ok(file) => file,
+        Err(e) => {
+            println!("Cannot create archive file: {}", e);
+            return 1;
+        }
+    };
+
+    let mut response: Response = response;
+    if let Err(e) = std::io::copy(&mut response, &mut archive_file) {
+        println!("Cannot save downloaded archive: {}", e);
+        return 1;
+    }
+
+    drop(archive_file);
+    println!("Remote archive downloaded successfully.");
+
+    let mut local_manifest: Manifest = manifest.clone();
+
+    local_manifest.r#type = "TARLOCAL".to_string();
+    local_manifest.path = archive_path.to_string_lossy().into_owned();
+
+    let result: i32 = build_tar_local(&local_manifest);
+
+    if result != 0 {
+        println!("Remote archive build failed.");
+        return result;
+    }
+
+    println!("Remote archive build completed successfully.");
+    return 0;
 }
 
 pub fn build(path: String) -> i32 {
