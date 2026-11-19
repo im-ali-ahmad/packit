@@ -58,10 +58,10 @@ type = \"PROJECTLOCAL\"
 path = \"{}\"
 
 [files]
-base = \"path/to/base/distributable/dir\" # Relative to this file
+base = \"path/to/base/distributable/dir\" # Relative to project path
 
 [[files.extra]]
-source = \"path/to/extra/file/or/folder/source\" # Relative to this file
+source = \"path/to/extra/file/or/folder/source\" # Relative to project path
 dest = \"path/to/extra/file/or/folder/destination\" # Relative to base dir
 
 [[commands]]

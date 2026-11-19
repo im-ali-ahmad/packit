@@ -1,4 +1,6 @@
 .vscode/
 target/
+packit.out/
 
 Cargo.lock
+packit-config.toml
