@@ -1,15 +1,21 @@
 use crate::{installer_manifest, utils::hash_directory};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use reqwest::blocking::Response;
+use rayon::prelude::*;
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::{
     fs::{self, File},
-    io::Write,
-    path::{Path, PathBuf},
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
 };
 use tar::{Archive, Builder};
-use tempfile::TempDir;
-
+use tempfile::NamedTempFile;
+use walkdir::WalkDir;
+const MAX_ARCHIVE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_EXTRACTED_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT: u64 = 300;
+const PROGRESS_INTERVAL: u64 = 1024 * 1024;
 #[derive(Debug, Deserialize, Clone)]
 struct Manifest {
     r#type: String,
@@ -18,25 +24,21 @@ struct Manifest {
     commands: Vec<Command>,
     project: Project,
 }
-
 #[derive(Debug, Deserialize, Clone)]
 struct Files {
     base: String,
     extra: Vec<ExtraFile>,
 }
-
 #[derive(Debug, Deserialize, Clone)]
 struct ExtraFile {
     source: String,
     dest: String,
 }
-
 #[derive(Debug, Deserialize, Clone)]
 struct Command {
     file: String,
     name: String,
 }
-
 #[derive(Debug, Deserialize, Clone)]
 struct Project {
     uid: String,
@@ -46,60 +48,300 @@ struct Project {
     version: String,
     license: String,
 }
-
-fn parse_manifest(path: &str) -> Result<Manifest, String> {
-    let content: String = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    toml::from_str::<Manifest>(&content).map_err(|e| e.to_string())
+fn log(message: impl std::fmt::Display) {
+    println!("[packit] {}", message);
 }
-
-fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
-    if !src.is_dir() {
+fn log_in_same_line(message: impl std::fmt::Display) {
+    print!("[packit] {}", message);
+}
+fn log_step(message: impl std::fmt::Display) {
+    println!("\n[packit] {}", message);
+}
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{:.2} {}", size, UNITS[unit])
+}
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() >= 60 {
+        format!(
+            "{}m {:.2}s",
+            duration.as_secs() / 60,
+            duration.as_secs_f64() % 60.0
+        )
+    } else {
+        format!("{:.2}s", duration.as_secs_f64())
+    }
+}
+fn parse_manifest(path: &str) -> Result<Manifest, String> {
+    log_step(format!("Loading manifest '{}'.", path));
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Cannot read manifest '{}': {}", path, e))?;
+    let manifest: Manifest =
+        toml::from_str(&content).map_err(|e| format!("Invalid manifest: {}", e))?;
+    log("Manifest loaded successfully.");
+    log(format!("Package type: {}", manifest.r#type));
+    log(format!("Project: {}", manifest.project.name));
+    log(format!("Version: {}", manifest.project.version));
+    log(format!("UID: {}", manifest.project.uid));
+    Ok(manifest)
+}
+fn validate_relative_path(path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() {
+        return Err("Path cannot be empty.".into());
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => {
+                return Err(format!("Invalid relative path '{}'.", path.display()));
+            }
+        }
+    }
+    Ok(path.to_path_buf())
+}
+fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let relative = validate_relative_path(relative)?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve root '{}': {}", root.display(), e))?;
+    let path = canonical_root.join(relative);
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve '{}': {}", path.display(), e))?;
+    if !canonical_path.starts_with(&canonical_root) {
         return Err(format!(
-            "Source path '{}' is not a directory.",
-            src.display()
+            "Path '{}' escapes its project directory.",
+            path.display()
         ));
     }
-
-    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-
-    for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+    Ok(canonical_path)
+}
+fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
+    log(format!(
+        "Copying directory '{}' -> '{}'.",
+        src.display(),
+        dest.display()
+    ));
+    if !src.is_dir() {
+        return Err(format!("Source '{}' is not a directory.", src.display()));
+    }
+    let src = src
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve source directory: {}", e))?;
+    let dest_absolute = if dest.is_absolute() {
+        dest.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(dest)
+    };
+    if dest_absolute.starts_with(&src) {
+        return Err("Destination cannot be inside the source directory.".into());
+    }
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&src).follow_links(false) {
         let entry = entry.map_err(|e| e.to_string())?;
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        let dest_path = dest.join(entry.file_name());
-
-        if file_type.is_dir() {
-            copy_dir_content(&entry.path(), &dest_path)?;
-        } else if file_type.is_file() {
-            fs::copy(&entry.path(), &dest_path).map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path == src {
+            continue;
+        }
+        let relative = path.strip_prefix(&src).map_err(|e| e.to_string())?;
+        let destination = dest_absolute.join(relative);
+        let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Symbolic links are not supported: '{}'.",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            directories.push(destination);
+        } else if metadata.is_file() {
+            files.push((path.to_path_buf(), destination, metadata.len()));
+        } else {
+            return Err(format!("Unsupported file type: '{}'.", path.display()));
         }
     }
-
+    fs::create_dir_all(&dest_absolute).map_err(|e| format!("Cannot create destination: {}", e))?;
+    for directory in directories {
+        fs::create_dir_all(&directory)
+            .map_err(|e| format!("Cannot create directory '{}': {}", directory.display(), e))?;
+    }
+    let total_files = files.len();
+    let total_size: u64 = files.iter().map(|(_, _, size)| *size).sum();
+    log(format!(
+        "Copying {} files ({}).",
+        total_files,
+        format_size(total_size)
+    ));
+    let copied = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<Result<(), String>> = files
+        .par_iter()
+        .map(|(source, destination, _)| {
+            fs::copy(source, destination)
+                .map(|_| {
+                    copied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                })
+                .map_err(|e| {
+                    format!(
+                        "Cannot copy '{}' to '{}': {}",
+                        source.display(),
+                        destination.display(),
+                        e
+                    )
+                })
+        })
+        .collect();
+    for result in results {
+        result?;
+    }
+    log(format!(
+        "Copied {} of {} files ({}).",
+        copied.load(std::sync::atomic::Ordering::Relaxed),
+        total_files,
+        format_size(total_size)
+    ));
     Ok(())
 }
-
-fn pack_folder(src: &Path, manifest: &Manifest, out_path: &PathBuf) -> i32 {
-    let mut success: bool = true;
-    let manifest_file: PathBuf = out_path.join("packit-manifest.toml");
-
-    let mut commands: Vec<installer_manifest::Command> = Vec::new();
-    for command in &manifest.commands {
-        let command_path: PathBuf = src.join(&command.file);
-        if !command_path.exists() {
-            println!(
-                "Command file '{}' does not exist.",
-                command_path.to_string_lossy()
-            );
-
-            success = false;
-            break;
+fn valid_filename_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+fn append_directory(archive: &mut Builder<GzEncoder<File>>, src: &Path) -> Result<(), String> {
+    let mut entries = WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    entries.sort_by(|a, b| a.path().cmp(b.path()));
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut total_size = 0u64;
+    for entry in entries {
+        let path = entry.path();
+        if path == src {
+            continue;
         }
-
+        let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Symbolic links are not supported: '{}'.",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            directories.push(path.to_path_buf());
+        } else if metadata.is_file() {
+            total_size = total_size
+                .checked_add(metadata.len())
+                .ok_or_else(|| "Archive size overflow.".to_string())?;
+            files.push((path.to_path_buf(), metadata.len()));
+        } else {
+            return Err(format!("Unsupported file type: '{}'.", path.display()));
+        }
+    }
+    log(format!(
+        "Archiving {} files and {} directories ({}).",
+        files.len(),
+        directories.len(),
+        format_size(total_size)
+    ));
+    for directory in directories {
+        let relative = directory.strip_prefix(src).map_err(|e| e.to_string())?;
+        archive
+            .append_dir(relative, &directory)
+            .map_err(|e| format!("Cannot archive directory: {}", e))?;
+    }
+    let mut processed = 0u64;
+    let mut last_percent = 0u64;
+    for (path, size) in files {
+        let relative = path.strip_prefix(src).map_err(|e| e.to_string())?;
+        archive
+            .append_path_with_name(&path, relative)
+            .map_err(|e| format!("Cannot archive '{}': {}", path.display(), e))?;
+        processed = processed.saturating_add(size);
+        let percent = if total_size == 0 {
+            100
+        } else {
+            ((processed as f64 / total_size as f64) * 100.0) as u64
+        };
+        while last_percent < percent {
+            last_percent += 1;
+            log_in_same_line(format!(
+                "Archive progress: {}% ({}/{})\r",
+                last_percent,
+                format_size(processed),
+                format_size(total_size)
+            ));
+            std::io::stdout()
+                .flush()
+                .map_err(|e| format!("Cannot flush progress output: {}", e))?;
+        }
+    }
+    if last_percent == 0 {
+        log("\nArchive progress: 100%.");
+    }
+    log("Archive entries written successfully.");
+    Ok(())
+}
+fn pack_folder(src: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+    let started = Instant::now();
+    log_step("Creating package.");
+    let src = src
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve source directory: {}", e))?;
+    if !src.is_dir() {
+        return Err("Source path must be a directory.".into());
+    }
+    if !valid_filename_component(&manifest.project.uid)
+        || !valid_filename_component(&manifest.project.version)
+    {
+        return Err("Invalid project UID or version.".into());
+    }
+    let output_dir = src
+        .parent()
+        .ok_or_else(|| "Cannot resolve package output directory.".to_string())?
+        .to_path_buf();
+    let manifest_file = src.join("packit-manifest.toml");
+    if manifest_file.exists() {
+        log("Removing previous installer manifest.");
+        fs::remove_file(&manifest_file)
+            .map_err(|e| format!("Cannot remove previous manifest: {}", e))?;
+    }
+    log_step("Validating command files.");
+    let mut commands = Vec::with_capacity(manifest.commands.len());
+    for command in &manifest.commands {
+        log(format!(
+            "Checking command '{}': {}",
+            command.name, command.file
+        ));
+        let command_path = resolve_path(&src, &command.file)?;
+        if !command_path.is_file() {
+            return Err(format!(
+                "Command file '{}' is not a regular file.",
+                command.file
+            ));
+        }
         commands.push(installer_manifest::Command {
             file: command.file.clone(),
             name: command.name.clone(),
         });
     }
-
+    log_step("Calculating project hash.");
+    let hash = hash_directory(&src).map_err(|e| format!("Cannot hash project directory: {}", e))?;
+    log(format!("Project hash: {}", hash));
     let install_manifest = installer_manifest::Manifest {
         commands,
         project: installer_manifest::Project {
@@ -110,332 +352,500 @@ fn pack_folder(src: &Path, manifest: &Manifest, out_path: &PathBuf) -> i32 {
             version: manifest.project.version.clone(),
             license: manifest.project.license.clone(),
         },
-        hash: if let Ok(h) = hash_directory(src) {
-            h
-        } else {
-            println!("Cannot compute hash of the folder.");
-            success = false;
-            String::new()
-        },
+        hash,
     };
-
-    let serialized = match toml::to_string(&install_manifest) {
-        Ok(data) => data,
-        Err(e) => {
-            println!("Cannot serialize manifest: {}", e);
-            success = false;
-            String::new()
-        }
-    };
-
-    if success {
-        if let Err(e) =
-            File::create(&manifest_file).and_then(|mut file| file.write_all(serialized.as_bytes()))
-        {
-            println!("Cannot write manifest file: {}", e);
-            success = false;
-        }
-    }
-
-    if !success {
-        return 1;
-    }
-
-    let pack_path: File = if let Ok(p) = File::create(format!(
+    log_step("Generating installer manifest.");
+    let serialized = toml::to_string(&install_manifest)
+        .map_err(|e| format!("Cannot serialize manifest: {}", e))?;
+    fs::write(&manifest_file, serialized).map_err(|e| format!("Cannot write manifest: {}", e))?;
+    log(format!(
+        "Installer manifest created: '{}'.",
+        manifest_file.display()
+    ));
+    let output_path = output_dir.join(format!(
         "{}-{}.pack",
         manifest.project.uid, manifest.project.version
-    )) {
-        p
-    } else {
-        println!("Cannot create output file.");
-        return 1;
-    };
-
-    let encoder: GzEncoder<File> = GzEncoder::new(pack_path, Compression::default());
-    let archive: Builder<GzEncoder<File>> = Builder::new(encoder);
-    let encoder: GzEncoder<File> = if let Ok(e) = archive.into_inner() {
-        e
-    } else {
-        println!("Cannot create archive.");
-        return 1;
-    };
-
-    match encoder.finish() {
-        Ok(_) => {}
-        Err(_) => {
-            println!("Cannot finish archive.");
-            return 1;
-        }
-    };
-
-    println!(
-        "Project packed successfully. Output file: '{}-{}.pack'",
-        manifest.project.uid, manifest.project.version
-    );
-    return 0;
+    ));
+    log_step("Preparing temporary package.");
+    let temporary_file = NamedTempFile::new_in(&output_dir)
+        .map_err(|e| format!("Cannot create temporary archive: {}", e))?;
+    let file = temporary_file
+        .reopen()
+        .map_err(|e| format!("Cannot open temporary archive: {}", e))?;
+    log_step("Compressing and archiving project.");
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut archive = Builder::new(encoder);
+    append_directory(&mut archive, &src)?;
+    log_step("Finalizing archive.");
+    let encoder = archive
+        .into_inner()
+        .map_err(|e| format!("Cannot finalize TAR archive: {}", e))?;
+    encoder
+        .finish()
+        .map_err(|e| format!("Cannot finish compressed archive: {}", e))?;
+    log_step("Saving final package.");
+    temporary_file
+        .persist(&output_path)
+        .map_err(|e| format!("Cannot save package: {}", e.error))?;
+    let size = fs::metadata(&output_path)
+        .map_err(|e| format!("Cannot read package metadata: {}", e))?
+        .len();
+    log(format!("Package: {}", output_path.display()));
+    log(format!("Package size: {}", format_size(size)));
+    log(format!(
+        "Packaging completed in {}.",
+        format_duration(started.elapsed())
+    ));
+    Ok(output_path)
 }
-
-fn build_project_local(manifest: &Manifest, cwd: String) -> i32 {
-    if let Some(files) = &manifest.files {
-        let project_path: PathBuf = Path::new(&cwd).join(&manifest.path);
+fn prepare_output_dir(path: &Path) -> Result<(), String> {
+    log_step(format!("Preparing output directory '{}'.", path.display()));
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "Output path '{}' is not a regular directory.",
+                path.display()
+            ));
+        }
+        log("Removing previous output directory.");
+        fs::remove_dir_all(path)
+            .map_err(|e| format!("Cannot remove previous output directory: {}", e))?;
+    }
+    fs::create_dir_all(path).map_err(|e| format!("Cannot create output directory: {}", e))?;
+    log("Output directory ready.");
+    Ok(())
+}
+fn build_project_contents(
+    manifest: &Manifest,
+    project_path: &Path,
+    out_path: &Path,
+) -> Result<(), String> {
+    let started = Instant::now();
+    log_step("Preparing project files.");
+    let files = manifest
+        .files
+        .as_ref()
+        .ok_or_else(|| "No files specified in the manifest.".to_string())?;
+    let project_path = project_path
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve project directory: {}", e))?;
+    if !project_path.is_dir() {
+        return Err("Project path is not a directory.".into());
+    }
+    log(format!("Project base: {}", project_path.display()));
+    log_step("Resolving base files.");
+    let base_path = resolve_path(&project_path, &files.base)?;
+    if !base_path.is_dir() {
+        return Err(format!(
+            "Base '{}' is not a directory.",
+            base_path.display()
+        ));
+    }
+    log(format!("Base directory: {}", base_path.display()));
+    prepare_output_dir(out_path)?;
+    log_step("Copying base files.");
+    copy_dir_content(&base_path, out_path)?;
+    log_step("Copying extra files.");
+    for (index, extra) in files.extra.iter().enumerate() {
+        log(format!(
+            "Extra file {}/{}: {} -> {}",
+            index + 1,
+            files.extra.len(),
+            extra.source,
+            extra.dest
+        ));
+        let source = resolve_path(&project_path, &extra.source)?;
+        let relative_dest = validate_relative_path(&extra.dest)?;
+        let destination = out_path.join(relative_dest);
+        if source.is_dir() {
+            if destination.exists() && !destination.is_dir() {
+                return Err(format!(
+                    "Destination '{}' is not a directory.",
+                    destination.display()
+                ));
+            }
+            copy_dir_content(&source, &destination)?;
+        } else if source.is_file() {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| "Invalid destination path.".to_string())?;
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            let size = fs::copy(&source, &destination).map_err(|e| {
+                format!(
+                    "Cannot copy '{}' to '{}': {}",
+                    source.display(),
+                    destination.display(),
+                    e
+                )
+            })?;
+            log(format!("Copied {}.", format_size(size)));
+        } else {
+            return Err(format!("Unsupported extra file '{}'.", source.display()));
+        }
+    }
+    log(format!(
+        "Project files prepared in {}.",
+        format_duration(started.elapsed())
+    ));
+    Ok(())
+}
+fn build_project_local(manifest: &Manifest, cwd: &Path) -> i32 {
+    let started = Instant::now();
+    log_step("Starting local project build.");
+    let result = (|| -> Result<PathBuf, String> {
+        log("Resolving project path.");
+        let project_path = resolve_path(cwd, &manifest.path)?;
         if !project_path.is_dir() {
-            println!(
-                "Project folder '{}' does not exist.",
-                project_path.to_string_lossy()
-            );
-
-            return 1;
+            return Err(format!(
+                "Project '{}' is not a directory.",
+                project_path.display()
+            ));
         }
-
-        let base_path: PathBuf = project_path.join(&files.base);
-        if !base_path.is_dir() {
-            println!(
-                "Base folder '{}' does not exist.",
-                base_path.to_string_lossy()
-            );
-
-            return 1;
+        log(format!("Project directory: {}", project_path.display()));
+        let out_path = project_path.join("packit.out");
+        build_project_contents(manifest, &project_path, &out_path)?;
+        pack_folder(&out_path, manifest)
+    })();
+    match result {
+        Ok(path) => {
+            log_step("Build completed successfully.");
+            log(format!("Package created: {}", path.display()));
+            log(format!(
+                "Total build time: {}.",
+                format_duration(started.elapsed())
+            ));
+            0
         }
-
-        let mut success: bool = true;
-        let out_path: PathBuf = project_path.join("packit.out");
-
-        if out_path.exists() {
-            let _ = out_path
-                .canonicalize()
-                .map_err(|e| e.to_string())
-                .map(|p| fs::remove_dir_all(p).map_err(|e| e.to_string()))
-                .unwrap_or_else(|e| {
-                    println!("Cannot remove existing output folder: {}", e);
-                    success = false;
-                    Ok(())
-                });
-
-            if !success {
-                return 1;
-            }
+        Err(e) => {
+            log_step("Build failed.");
+            log(e);
+            log(format!(
+                "Elapsed time: {}.",
+                format_duration(started.elapsed())
+            ));
+            1
         }
-
-        fs::create_dir_all(&out_path)
-            .map_err(|e| e.to_string())
-            .unwrap_or_else(|_| {
-                println!(
-                    "Cannot create output folder '{}'.",
-                    out_path.to_string_lossy()
-                );
-                success = false;
-            });
-
-        if !success {
-            return 1;
-        }
-
-        match copy_dir_content(&base_path, &out_path) {
-            Ok(_) => {}
-            Err(e) => {
-                println!("Cannot copy base folder: {}", e);
-                return 1;
-            }
-        }
-
-        for file in &files.extra {
-            let source_path: PathBuf = project_path.join(&file.source);
-            let dest_path: PathBuf = out_path.join(&file.dest);
-
-            if !source_path.exists() {
-                println!(
-                    "Extra file/folder '{}' does not exist.",
-                    source_path.to_string_lossy()
-                );
-                success = false;
-                continue;
-            }
-
-            if source_path.is_dir() {
-                match copy_dir_content(&source_path, &dest_path) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        println!("Cannot copy extra folder: {}", e);
-                        success = false;
-                    }
-                }
-            } else if source_path.is_file() {
-                fs::create_dir_all(dest_path.parent().unwrap())
-                    .map_err(|e| e.to_string())
-                    .unwrap_or_else(|_| {
-                        println!(
-                            "Cannot create destination folder '{}'.",
-                            dest_path.parent().unwrap().to_string_lossy()
-                        );
-                        success = false;
-                    });
-
-                if !success {
-                    continue;
-                }
-
-                fs::copy(&source_path, &dest_path)
-                    .map_err(|e| e.to_string())
-                    .unwrap_or_else(|_| {
-                        println!(
-                            "Cannot copy extra file '{}' to '{}'.",
-                            source_path.to_string_lossy(),
-                            dest_path.to_string_lossy()
-                        );
-                        success = false;
-                        0
-                    });
-            }
-
-            if !success {
-                return 1;
-            }
-        }
-
-        println!(
-            "Project local build completed successfully. Output folder: '{}'",
-            out_path.to_string_lossy()
-        );
-
-        return pack_folder(&out_path, manifest, &out_path);
     }
-
-    println!("No files specified in the manifest.");
-    return 1;
 }
-
+fn validate_archive(archive: &mut Archive<GzDecoder<File>>) -> Result<u64, String> {
+    log_step("Validating archive entries.");
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Cannot read archive entries: {}", e))?;
+    let mut total_size = 0u64;
+    let mut count = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Invalid archive entry: {}", e))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("Cannot read archive path: {}", e))?;
+        if path.to_string_lossy().contains('\\') {
+            return Err(format!("Unsafe archive path '{}'.", path.display()));
+        }
+        for component in path.components() {
+            match component {
+                Component::Normal(_) | Component::CurDir => {}
+                _ => {
+                    return Err(format!("Unsafe archive path '{}'.", path.display()));
+                }
+            }
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(format!(
+                "Archive links are not supported: '{}'.",
+                path.display()
+            ));
+        }
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(format!("Unsupported archive entry '{}'.", path.display()));
+        }
+        if kind.is_file() {
+            let size = entry
+                .header()
+                .size()
+                .map_err(|e| format!("Cannot read entry size: {}", e))?;
+            total_size = total_size
+                .checked_add(size)
+                .ok_or_else(|| "Archive extracted size overflow.".to_string())?;
+            if total_size > MAX_EXTRACTED_SIZE {
+                return Err("Archive exceeds the maximum extracted size.".into());
+            }
+        }
+        count += 1;
+    }
+    log(format!("Validated {} archive entries.", count));
+    log(format!(
+        "Total extracted size: {}.",
+        format_size(total_size)
+    ));
+    Ok(total_size)
+}
+fn build_from_archive(
+    manifest: &Manifest,
+    archive_path: &Path,
+    out_path: &Path,
+) -> Result<PathBuf, String> {
+    log_step("Preparing archive build.");
+    if !archive_path.is_file() {
+        return Err(format!(
+            "Archive '{}' does not exist.",
+            archive_path.display()
+        ));
+    }
+    let archive_size = fs::metadata(archive_path).map_err(|e| e.to_string())?.len();
+    if archive_size > MAX_ARCHIVE_SIZE {
+        return Err("Archive exceeds the maximum allowed size.".into());
+    }
+    log(format!("Archive: {}", archive_path.display()));
+    log(format!("Archive size: {}", format_size(archive_size)));
+    log_step("Checking archive integrity and safety.");
+    let archive_file =
+        File::open(archive_path).map_err(|e| format!("Cannot open archive: {}", e))?;
+    let decoder = GzDecoder::new(archive_file);
+    let mut archive = Archive::new(decoder);
+    validate_archive(&mut archive)?;
+    log_step("Creating temporary extraction directory.");
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| format!("Cannot create temporary directory: {}", e))?;
+    log(format!(
+        "Extraction directory: {}",
+        temp_dir.path().display()
+    ));
+    log_step("Extracting archive.");
+    let archive_file =
+        File::open(archive_path).map_err(|e| format!("Cannot reopen archive: {}", e))?;
+    let decoder = GzDecoder::new(archive_file);
+    let mut archive = Archive::new(decoder);
+    archive
+        .unpack(temp_dir.path())
+        .map_err(|e| format!("Cannot extract archive: {}", e))?;
+    log("Archive extracted successfully.");
+    let mut local_manifest = manifest.clone();
+    local_manifest.files = Some(Files {
+        base: ".".to_string(),
+        extra: Vec::new(),
+    });
+    log_step("Preparing extracted project files.");
+    build_project_contents(&local_manifest, temp_dir.path(), out_path)?;
+    log_step("Creating package from extracted project.");
+    let package = pack_folder(out_path, &local_manifest)?;
+    log("Archive build completed successfully.");
+    Ok(package)
+}
 fn build_tar_local(manifest: &Manifest) -> i32 {
-    println!("Extracting local archive: '{}'", manifest.path);
-
-    let archive_file: File = match File::open(&manifest.path) {
-        Ok(file) => file,
-        Err(e) => {
-            println!("Cannot open archive: {}", e);
-            return 1;
+    let started = Instant::now();
+    log_step("Starting local TAR build.");
+    let result = (|| -> Result<PathBuf, String> {
+        let archive_path = Path::new(&manifest.path);
+        let archive_path = if archive_path.is_absolute() {
+            archive_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(archive_path)
+        };
+        let archive_path = archive_path
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve archive path: {}", e))?;
+        let parent = archive_path
+            .parent()
+            .ok_or_else(|| "Cannot resolve archive parent directory.".to_string())?;
+        let out_path = parent.join("packit.out");
+        log(format!("Archive parent: {}", parent.display()));
+        log(format!("Output directory: {}", out_path.display()));
+        log(format!(
+            "Final package will be saved in: {}",
+            parent.display()
+        ));
+        build_from_archive(manifest, &archive_path, &out_path)
+    })();
+    match result {
+        Ok(path) => {
+            log_step("Local TAR build completed successfully.");
+            log(format!("Package created: {}", path.display()));
+            log(format!(
+                "Total build time: {}.",
+                format_duration(started.elapsed())
+            ));
+            0
         }
-    };
-
-    let temp_dir: TempDir = match tempfile::tempdir() {
-        Ok(dir) => dir,
         Err(e) => {
-            println!("Cannot create temporary directory: {}", e);
-            return 1;
+            log_step("Local TAR build failed.");
+            log(e);
+            log(format!(
+                "Elapsed time: {}.",
+                format_duration(started.elapsed())
+            ));
+            1
         }
-    };
-
-    let decoder: GzDecoder<File> = GzDecoder::new(archive_file);
-    let mut archive: Archive<GzDecoder<File>> = Archive::new(decoder);
-
-    if let Err(e) = archive.unpack(temp_dir.path()) {
-        println!("Cannot extract archive: {}", e);
-        return 1;
     }
-
-    println!("Archive extracted successfully.");
-    let mut local_manifest: Manifest = manifest.clone();
-
-    local_manifest.r#type = "PROJECTLOCAL".to_string();
-    local_manifest.path = ".".to_string();
-
-    let cwd: String = temp_dir.path().to_string_lossy().into_owned();
-    let result: i32 = build_project_local(&local_manifest, cwd);
-
-    if result != 0 {
-        println!("Local archive build failed.");
-        return result;
-    }
-
-    println!("Local archive build completed successfully.");
-    return 0;
 }
-
-fn build_tar_remote(manifest: &Manifest) -> i32 {
-    let url: &String = &manifest.path;
-    println!("Downloading remote archive: '{}'", url);
-
-    let response: Response = match reqwest::blocking::get(url) {
-        Ok(response) => response,
-        Err(e) => {
-            println!("Cannot download remote archive: {}", e);
-            return 1;
-        }
-    };
-
+fn download_archive(client: &Client, url: &str, destination: &Path) -> Result<u64, String> {
+    log_step(format!("Downloading '{}'.", url));
+    let mut response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("Cannot download remote archive: {}", e))?;
     if !response.status().is_success() {
-        println!("Remote server returned HTTP status: {}", response.status());
-        return 1;
+        return Err(format!(
+            "Remote server returned HTTP status {}.",
+            response.status()
+        ));
     }
-
-    let temp_dir: TempDir = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            println!("Cannot create temporary directory: {}", e);
-            return 1;
+    let content_length = response.content_length();
+    if let Some(length) = content_length {
+        if length > MAX_ARCHIVE_SIZE {
+            return Err("Remote archive exceeds the maximum allowed size.".into());
         }
-    };
-
-    let archive_path: PathBuf = temp_dir.path().join("remote.tar.gz");
-    let mut archive_file: File = match File::create(&archive_path) {
-        Ok(file) => file,
-        Err(e) => {
-            println!("Cannot create archive file: {}", e);
-            return 1;
+        log(format!("Remote file size: {}", format_size(length)));
+    } else {
+        log("Remote file size is unknown.");
+    }
+    let mut file = File::create(destination)
+        .map_err(|e| format!("Cannot create downloaded archive: {}", e))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    let mut last_percent = 0u64;
+    let mut last_reported = 0u64;
+    loop {
+        let count = response
+            .read(&mut buffer)
+            .map_err(|e| format!("Download interrupted: {}", e))?;
+        if count == 0 {
+            break;
         }
-    };
-
-    let mut response: Response = response;
-    if let Err(e) = std::io::copy(&mut response, &mut archive_file) {
-        println!("Cannot save downloaded archive: {}", e);
-        return 1;
+        downloaded = downloaded
+            .checked_add(count as u64)
+            .ok_or_else(|| "Download size overflow.".to_string())?;
+        if downloaded > MAX_ARCHIVE_SIZE {
+            return Err("Downloaded archive exceeds the maximum allowed size.".into());
+        }
+        file.write_all(&buffer[..count])
+            .map_err(|e| format!("Cannot write downloaded archive: {}", e))?;
+        match content_length {
+            Some(total) if total > 0 => {
+                let percent = (downloaded.saturating_mul(100) / total).min(100);
+                while last_percent < percent {
+                    last_percent += 1;
+                    log_in_same_line(format!(
+                        "Download progress: {}% ({}/{})\r",
+                        last_percent,
+                        format_size(downloaded),
+                        format_size(total)
+                    ));
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|e| format!("Cannot flush progress output: {}", e))?;
+                }
+            }
+            _ if downloaded.saturating_sub(last_reported) >= PROGRESS_INTERVAL => {
+                log(format!("Downloaded: {}", format_size(downloaded)));
+                last_reported = downloaded;
+            }
+            _ => {}
+        }
     }
-
-    drop(archive_file);
-    println!("Remote archive downloaded successfully.");
-
-    let mut local_manifest: Manifest = manifest.clone();
-
-    local_manifest.r#type = "TARLOCAL".to_string();
-    local_manifest.path = archive_path.to_string_lossy().into_owned();
-
-    let result: i32 = build_tar_local(&local_manifest);
-
-    if result != 0 {
-        println!("Remote archive build failed.");
-        return result;
+    file.flush()
+        .map_err(|e| format!("Cannot flush downloaded archive: {}", e))?;
+    if let Some(total) = content_length {
+        if downloaded != total {
+            return Err(format!(
+                "Incomplete download: expected {}, received {}.",
+                format_size(total),
+                format_size(downloaded)
+            ));
+        }
+        while last_percent < 100 {
+            last_percent += 1;
+            log_in_same_line(format!(
+                "Download progress: {}% ({}/{})\r",
+                last_percent,
+                format_size(downloaded),
+                format_size(total)
+            ));
+            std::io::stdout()
+                .flush()
+                .map_err(|e| format!("Cannot flush progress output: {}", e))?;
+        }
+        println!();
     }
-
-    println!("Remote archive build completed successfully.");
-    return 0;
+    log(format!("Download completed: {}.", format_size(downloaded)));
+    Ok(downloaded)
 }
-
-pub fn build(path: String) -> i32 {
-    match parse_manifest(&path) {
-        Ok(manifest) => {
-            if manifest.r#type == "PROJECTLOCAL" {
-                return build_project_local(
-                    &manifest,
-                    std::env::current_dir()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-
-            if manifest.r#type == "TARLOCAL" {
-                return build_tar_local(&manifest);
-            }
-
-            if manifest.r#type == "TARREMOTE" {
-                return build_tar_remote(&manifest);
-            }
-
-            println!("Invalid package type.");
-            return 1;
+fn build_tar_remote(manifest: &Manifest) -> i32 {
+    let started = Instant::now();
+    log_step("Starting remote TAR build.");
+    let result = (|| -> Result<PathBuf, String> {
+        log_step("Configuring HTTP client.");
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|e| format!("Cannot create HTTP client: {}", e))?;
+        log("HTTP client ready.");
+        log_step("Creating temporary download directory.");
+        let temp_dir =
+            tempfile::tempdir().map_err(|e| format!("Cannot create temporary directory: {}", e))?;
+        let archive_path = temp_dir.path().join("remote.tar.gz");
+        download_archive(&client, &manifest.path, &archive_path)?;
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let out_path = cwd.join("packit.out");
+        log(format!("Output directory: {}", out_path.display()));
+        log(format!("Final package will be saved in: {}", cwd.display()));
+        build_from_archive(manifest, &archive_path, &out_path)
+    })();
+    match result {
+        Ok(path) => {
+            log_step("Remote TAR build completed successfully.");
+            log(format!("Package created: {}", path.display()));
+            log(format!(
+                "Total build time: {}.",
+                format_duration(started.elapsed())
+            ));
+            0
         }
-
-        Err(err) => {
-            println!("Cannot parse manifest: {}", err);
-            return 1;
+        Err(e) => {
+            log_step("Remote TAR build failed.");
+            log(e);
+            log(format!(
+                "Elapsed time: {}.",
+                format_duration(started.elapsed())
+            ));
+            1
         }
     }
+}
+pub fn build(path: String) -> i32 {
+    let started = Instant::now();
+    log_step("Packit build started.");
+    let result = (|| -> Result<i32, String> {
+        let manifest = parse_manifest(&path)?;
+        match manifest.r#type.as_str() {
+            "PROJECTLOCAL" => {
+                let cwd = std::env::current_dir()
+                    .map_err(|e| format!("Cannot resolve working directory: {}", e))?;
+                Ok(build_project_local(&manifest, &cwd))
+            }
+            "TARLOCAL" => Ok(build_tar_local(&manifest)),
+            "TARREMOTE" => Ok(build_tar_remote(&manifest)),
+            _ => Err(format!("Invalid package type '{}'.", manifest.r#type)),
+        }
+    })();
+    let code = match result {
+        Ok(code) => code,
+        Err(e) => {
+            log_step("Build failed.");
+            log(e);
+            1
+        }
+    };
+    log(format!(
+        "Packit finished with exit code {} in {}.",
+        code,
+        format_duration(started.elapsed())
+    ));
+    code
 }
