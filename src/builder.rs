@@ -13,7 +13,7 @@ use tar::{Archive, Builder};
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 const MAX_ARCHIVE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_EXTRACTED_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_EXTRACTED_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: u64 = 300;
 const PROGRESS_INTERVAL: u64 = 1024 * 1024;
 #[derive(Debug, Deserialize, Clone)]

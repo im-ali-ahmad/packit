@@ -4,6 +4,7 @@ mod initializer;
 mod installer;
 mod remover;
 
+mod installed_manifest;
 mod installer_manifest;
 mod utils;
 

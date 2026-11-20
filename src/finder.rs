@@ -1,15 +1,6 @@
-pub fn find_all() {}
+use crate::installed_manifest::Package;
 
-pub struct Package {
-    pub uid: String,
-    pub name: String,
-    pub description: String,
-    pub authors: Vec<String>,
-    pub version: String,
-    pub license: String,
-    pub files: Vec<String>,
-    pub install_time: (u8, u8, u16),
-}
+pub fn find_all() {}
 
 pub fn find_raw(package: String) -> Result<Package, String> {
     Err("No such package found.".to_string())
@@ -27,7 +18,7 @@ pub fn find(package: String) -> i32 {
             println!("Files:        {} installed", item.files.len());
             println!(
                 "Install Date: {:02}/{:02}/{:4} DD/MM/YYYY",
-                item.install_time.0, item.install_time.1, item.install_time.2
+                item.install_date.0, item.install_date.1, item.install_date.2
             );
             return 0;
         }
