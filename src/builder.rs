@@ -1,4 +1,4 @@
-use crate::{installer_manifest, utils::hash_directory};
+use crate::{installer_manifest, utils::*};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rayon::prelude::*;
 use reqwest::blocking::Client;
@@ -47,15 +47,6 @@ struct Project {
     author: Vec<String>,
     version: String,
     license: String,
-}
-fn log(message: impl std::fmt::Display) {
-    println!("[packit] {}", message);
-}
-fn log_in_same_line(message: impl std::fmt::Display) {
-    print!("[packit] {}", message);
-}
-fn log_step(message: impl std::fmt::Display) {
-    println!("\n[packit] {}", message);
 }
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];

@@ -56,3 +56,12 @@ pub fn hash_directory(root: &Path) -> Result<String> {
     > = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{:02x}", b)).collect())
 }
+pub fn log(message: impl std::fmt::Display) {
+    println!("[packit] {}", message);
+}
+pub fn log_in_same_line(message: impl std::fmt::Display) {
+    print!("[packit] {}", message);
+}
+pub fn log_step(message: impl std::fmt::Display) {
+    println!("\n[packit] {}", message);
+}

@@ -1,4 +1,4 @@
-use crate::{installed_manifest::Package, installer_manifest::*};
+use crate::{installed_manifest::Package, installer_manifest::*, utils::*};
 use chrono::{Datelike, Local};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha512};
@@ -17,12 +17,6 @@ const MAX_EXTRACTED_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 const INSTALL_DIR: &str = ".local/packit.opt";
 const BIN_DIR: &str = ".local/bin";
 const INSTALL_MANIFEST: &str = "packit-manifest.toml";
-fn log(message: impl std::fmt::Display) {
-    println!("[packit] {}", message);
-}
-fn log_step(message: impl std::fmt::Display) {
-    println!("\n[packit] {}", message);
-}
 fn valid_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
@@ -431,16 +425,11 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
         files: Vec::new(),
         install_date: (day, month, year),
     };
-    for entry in WalkDir::new(&install_path) {
+    for entry in WalkDir::new(&*install_path) {
         let entry = entry.map_err(|e| format!("Cannot walk installation directory: {}", e))?;
         let path = entry.path();
         if path.is_file() {
-            let relative_path = path
-                .strip_prefix(&install_path)
-                .map_err(|e| e.to_string())?;
-            package
-                .files
-                .push(relative_path.to_string_lossy().to_string());
+            package.files.push(path.to_string_lossy().to_string());
         }
     }
     let manifest_content = toml::to_string(&package)
