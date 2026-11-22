@@ -4,9 +4,9 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashSet,
-    fs::{self, File},
+    fs::{self, File, Permissions},
     io::{self, Read},
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
 };
 use tar::Archive;
@@ -377,6 +377,13 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
             let target = install_path.join(validate_relative_path(&relative.file)?);
             symlink(&target, link)
                 .map_err(|e| format!("Cannot create command link '{}': {}", link.display(), e))?;
+            fs::set_permissions(&target, Permissions::from_mode(0o755)).map_err(|e| {
+                format!(
+                    "Cannot set executable permissions on '{}': {}",
+                    target.display(),
+                    e
+                )
+            })?;
             created_links.push(link.clone());
         }
         Ok(())

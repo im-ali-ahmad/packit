@@ -11,6 +11,12 @@ cargo build --release
 cp target/release/packit ~/.local/bin/
 ```
 
+OR
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/im-ali-ahmad/packit/main/install.sh" | bash
+```
+
 ## Commands
 
 ```bash
