@@ -1,6 +1,6 @@
 # PackIt
 
-A lightweight, self-contained Linux package manager and builder written in **Rust**. Bundle, distribute, and manage upstream applications directly without container overhead or AUR delays.
+A lightweight, self-contained Linux package manager and builder written in **Rust**. Bundle, distribute, and manage upstream applications directly without container overhead or Repository(ies) delays.
 
 ## Installation
 
@@ -14,23 +14,25 @@ cp target/release/packit ~/.local/bin/
 ## Commands
 
 ```bash
-packit init-project-local <PATH>   Initialize manifest from a local folder
-packit init-tar-local <PATH>       Initialize manifest from a local .tar archive
-packit init-tar-remote <URL>       Initialize manifest from a remote .tar URL
-packit build <MANIFEST_FILE>       Build a distributable .pack package
-packit install <PACKAGE_FILE>      Install a built package
-packit remove <PACKAGE_UID>        Uninstall a package by UID
-packit search <PACKAGE_UID>        Show metadata for an installed package
-packit list                        List all installed packages
-packit version                     Print current version
-packit help                        Show help message
+packit init-project-local <PATH>    # Initialize a package manifest from a local project directory
+packit init-tar-local <PATH>        # Initialize a package manifest from a local TAR archive
+packit init-tar-remote <URL>        # Initialize a package manifest from a remote TAR archive (HTTP/HTTPS)
+
+packit build <MANIFEST_FILE>        # Build a distributable package from a manifest
+packit install <PACKAGE_FILE>       # Install a built package
+packit remove <PACKAGE_UID>         # Uninstall an installed package
+packit search [PACKAGE_UID]         # Display an installed package's details or list all installed packages
+
+packit version [--only-numbers]     # Display the current version of Packit
+packit help                         # Display this help message
 ```
 
 ## Manifest Example
 
-Save as `vscode-x64-packit-config.toml`:
+Run exactly this for VSCODE Install/Upadte
 
-```toml
+```bash
+cat > vscode-install.toml << 'EOF'
 type = "TARREMOTE"
 path = "https://code.visualstudio.com/sha/download?build=stable&os=linux-x64"
 
@@ -45,6 +47,14 @@ description = "A free, cross-platform code editor."
 author = [ "microsoft" ]
 version = "LATEST"
 license = "Proprietary"
+EOF
+
+rm -f microsoft.vscode-*.pack
+(sleep 1 && rm vscode-install.toml) & packit build vscode-install.toml
+packit install $(ls microsoft.vscode-*.pack)
+rm -f microsoft.vscode-*.pack
+
+packit search microsoft.vscode
 ```
 
 ## Quick Workflow
@@ -52,7 +62,7 @@ license = "Proprietary"
 ```
 packit build vscode-x64-packit-config.toml
 packit install microsoft.vscode-LATEST.pack
-packit list
+packit search
 ```
 
 ## License

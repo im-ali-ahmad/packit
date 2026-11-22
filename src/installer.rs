@@ -218,10 +218,7 @@ fn confirm_replacement(name: &str) -> Result<bool, String> {
     let stdin = io::stdin();
     for attempt in 1..=2 {
         println!("[packit] Package '{}' is already installed.", name);
-        println!(
-            "[packit] Confirm replacement ({}/2). Type 'yes' to continue:",
-            attempt
-        );
+        println!("[packit] Confirm replacement ({}/2). [yes??]:", attempt);
         let mut input = String::new();
         stdin
             .read_line(&mut input)
@@ -432,7 +429,7 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
             package.files.push(path.to_string_lossy().to_string());
         }
     }
-    let manifest_content = toml::to_string(&package)
+    let manifest_content = toml::to_string_pretty(&package)
         .map_err(|e| format!("Cannot serialize installed manifest: {}", e))?;
     fs::write(&manifest_path, manifest_content)
         .map_err(|e| format!("Cannot write installed manifest: {}", e))?;

@@ -1,10 +1,10 @@
 mod builder;
 mod finder;
 mod initializer;
-mod installer;
-mod remover;
 mod installed_manifest;
+mod installer;
 mod installer_manifest;
+mod remover;
 mod utils;
 use std::{env::args, process::exit};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -12,22 +12,39 @@ fn print_help() {
     println!(
         "\
 packit v{VERSION}
-A lightweight Linux package manager and builder.
+A lightweight Linux package manager and package builder.
 
 USAGE:
-    packit <COMMAND> [ARGUMENT]
+    packit <COMMAND> [ARGUMENTS]
 
 COMMANDS:
-    init-project-local <PATH>   Initialize a package manifest from a local project folder
-    init-tar-local <PATH>       Initialize a package manifest from a local .tar archive
-    init-tar-remote <URL>       Initialize a package manifest from a remote .tar URL (HTTP/HTTPS)
-    build <MANIFEST_FILE>       Build a distributable package from an initialized manifest file
-    install <PACKAGE_FILE>      Install a built package onto the system
-    remove <PACKAGE_UID>        Uninstall a package using its unique ID
-    search <PACKAGE_UID>        Display metadata and details for an installed package
-    list                        List all currently installed packages
-    version                     Print the current version of packit
-    help                        Show this help message"
+    init-project-local <PATH>     Initialize a package manifest from a local project directory
+    init-tar-local <PATH>         Initialize a package manifest from a local TAR archive
+    init-tar-remote <URL>         Initialize a package manifest from a remote TAR archive (HTTP/HTTPS)
+
+    build <MANIFEST_FILE>         Build a distributable package from a manifest
+    install <PACKAGE_FILE>        Install a built package
+    remove <PACKAGE_UID>          Uninstall an installed package
+    search [PACKAGE_UID]          Display an installed package's details or list all installed packages
+
+    version [--only-numbers]      Display the current version of Packit
+    help                          Display this help message
+
+EXAMPLES:
+    packit init-project-local ./my-project
+    packit init-tar-local ./source.tar.gz
+    packit init-tar-remote https://example.com/source.tar.gz
+
+    packit build packit.toml
+    packit install package.pack
+    packit remove com.example.package
+    packit search com.example.package
+    packit search
+    packit list
+
+    packit version
+    packit version --only-numbers
+    packit help"
     );
 }
 fn main() {
@@ -47,9 +64,18 @@ fn main() {
             exit(0);
         }
         "version" => {
-            if argc > 2 {
+            if argc > 3 {
                 println!("Too many arguments. Use 'help' for usage.");
                 exit(1);
+            }
+            if argc == 3 {
+                if args[2] == "--only-numbers" {
+                    println!("{}", VERSION);
+                    exit(0);
+                } else {
+                    println!("Unknown argument '{}'. Use 'help' for usage.", args[2]);
+                    exit(1);
+                }
             }
             println!("packit Version: {}", VERSION);
             exit(0);
@@ -105,20 +131,16 @@ fn main() {
             }
             exit(remover::remove(args[2].clone()));
         }
-        "list" => {
+        "search" => {
             if argc > 2 {
-                println!("Too many arguments. Use 'help' for usage.");
-                exit(1);
+                if argc > 3 {
+                    println!("Too many arguments. Use 'help' for usage.");
+                    exit(1);
+                }
+                exit(finder::find(args[2].clone()));
             }
             finder::find_all();
             exit(0);
-        }
-        "search" => {
-            if argc != 3 {
-                println!("Too many or less arguments. Use 'help' for usage.");
-                exit(1);
-            }
-            exit(finder::find(args[2].clone()));
         }
         cmd => {
             println!("Unknown command '{}'. Use 'help' for usage.", cmd);

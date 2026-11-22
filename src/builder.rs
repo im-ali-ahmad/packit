@@ -5,7 +5,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -69,18 +69,63 @@ fn format_duration(duration: Duration) -> String {
         format!("{:.2}s", duration.as_secs_f64())
     }
 }
-fn parse_manifest(path: &str) -> Result<Manifest, String> {
+fn parse_version(manifest: &mut Manifest, parent: &Path) -> Result<Manifest, String> {
+    let version = &manifest.project.version;
+    if let Some(raw_cmd) = version
+        .strip_prefix("bash(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let parent = parent
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve PARENT directory: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+        let cmd = raw_cmd.replace("$PARENT", &parent);
+        for attempt in 1..=2 {
+            print!(
+                "Confirmation ({}/2): Execute bash command `{}`? [yes??]: ",
+                attempt, cmd
+            );
+            io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| e.to_string())?;
+            if input.trim().to_lowercase() != "yes" {
+                return Err("Command execution aborted by user.".into());
+            }
+        }
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .map_err(|e| format!("Failed to execute bash: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Bash command failed: {}", stderr.trim()));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            return Err("Version command returned an empty value.".into());
+        }
+        manifest.project.version = stdout;
+    }
+    Ok(manifest.clone())
+}
+fn parse_manifest(path: &str) -> Result<(Manifest, PathBuf), String> {
     log_step(format!("Loading manifest '{}'.", path));
     let content =
         fs::read_to_string(path).map_err(|e| format!("Cannot read manifest '{}': {}", path, e))?;
     let manifest: Manifest =
         toml::from_str(&content).map_err(|e| format!("Invalid manifest: {}", e))?;
+    let manifest_path =
+        fs::canonicalize(path).map_err(|e| format!("Cannot resolve manifest path: {}", e))?;
     log("Manifest loaded successfully.");
     log(format!("Package type: {}", manifest.r#type));
     log(format!("Project: {}", manifest.project.name));
     log(format!("Version: {}", manifest.project.version));
     log(format!("UID: {}", manifest.project.uid));
-    Ok(manifest)
+    Ok((manifest, manifest_path))
 }
 fn validate_relative_path(path: &str) -> Result<PathBuf, String> {
     let path = Path::new(path);
@@ -113,6 +158,23 @@ fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(canonical_path)
+}
+fn cleanup_output_dir(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("Cannot inspect output '{}': {}", path.display(), e))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "Refusing to remove unexpected output '{}'.",
+            path.display()
+        ));
+    }
+    fs::remove_dir_all(path)
+        .map_err(|e| format!("Cannot remove output '{}': {}", path.display(), e))?;
+    log(format!("Removed temporary output '{}'.", path.display()));
+    Ok(())
 }
 fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
     log(format!(
@@ -481,12 +543,27 @@ fn build_project_contents(
     ));
     Ok(())
 }
-fn build_project_local(manifest: &Manifest, cwd: &Path) -> i32 {
+fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
     let started = Instant::now();
     log_step("Starting local project build.");
+    let project_path = match manifest_file_path
+        .parent()
+        .ok_or_else(|| "Cannot resolve manifest parent directory.".to_string())
+        .and_then(|parent| {
+            parent
+                .join(&manifest.path)
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve project path: {}", e))
+        }) {
+        Ok(path) => path,
+        Err(e) => {
+            log_step("Build failed.");
+            log(e);
+            return 1;
+        }
+    };
+    let out_path = project_path.join("packit.out");
     let result = (|| -> Result<PathBuf, String> {
-        log("Resolving project path.");
-        let project_path = resolve_path(cwd, &manifest.path)?;
         if !project_path.is_dir() {
             return Err(format!(
                 "Project '{}' is not a directory.",
@@ -494,12 +571,14 @@ fn build_project_local(manifest: &Manifest, cwd: &Path) -> i32 {
             ));
         }
         log(format!("Project directory: {}", project_path.display()));
-        let out_path = project_path.join("packit.out");
-        build_project_contents(manifest, &project_path, &out_path)?;
-        pack_folder(&out_path, manifest)
+        let mut local_manifest = manifest.clone();
+        let local_manifest = parse_version(&mut local_manifest, &project_path)?;
+        build_project_contents(&local_manifest, &project_path, &out_path)?;
+        pack_folder(&out_path, &local_manifest)
     })();
-    match result {
-        Ok(path) => {
+    let cleanup_result = cleanup_output_dir(&out_path);
+    match (result, cleanup_result) {
+        (Ok(path), Ok(())) => {
             log_step("Build completed successfully.");
             log(format!("Package created: {}", path.display()));
             log(format!(
@@ -508,9 +587,18 @@ fn build_project_local(manifest: &Manifest, cwd: &Path) -> i32 {
             ));
             0
         }
-        Err(e) => {
+        (Ok(path), Err(e)) => {
+            log_step("Build completed with cleanup error.");
+            log(format!("Package created: {}", path.display()));
+            log(e);
+            1
+        }
+        (Err(e), cleanup) => {
             log_step("Build failed.");
             log(e);
+            if let Err(cleanup_error) = cleanup {
+                log(format!("Cleanup failed: {}", cleanup_error));
+            }
             log(format!(
                 "Elapsed time: {}.",
                 format_duration(started.elapsed())
@@ -600,9 +688,10 @@ fn build_from_archive(
     log_step("Creating temporary extraction directory.");
     let temp_dir =
         tempfile::tempdir().map_err(|e| format!("Cannot create temporary directory: {}", e))?;
+    let extracted_path = temp_dir.path().to_path_buf();
     log(format!(
         "Extraction directory: {}",
-        temp_dir.path().display()
+        extracted_path.display()
     ));
     log_step("Extracting archive.");
     let archive_file =
@@ -610,18 +699,31 @@ fn build_from_archive(
     let decoder = GzDecoder::new(archive_file);
     let mut archive = Archive::new(decoder);
     archive
-        .unpack(temp_dir.path())
+        .unpack(&extracted_path)
         .map_err(|e| format!("Cannot extract archive: {}", e))?;
     log("Archive extracted successfully.");
     let mut local_manifest = manifest.clone();
-    local_manifest.files = Some(Files {
-        base: ".".to_string(),
-        extra: Vec::new(),
-    });
-    log_step("Preparing extracted project files.");
-    build_project_contents(&local_manifest, temp_dir.path(), out_path)?;
-    log_step("Creating package from extracted project.");
-    let package = pack_folder(out_path, &local_manifest)?;
+    let local_manifest = parse_version(&mut local_manifest, &extracted_path)?;
+    let build_result = (|| -> Result<PathBuf, String> {
+        let mut build_manifest = local_manifest.clone();
+        build_manifest.files = Some(Files {
+            base: ".".to_string(),
+            extra: Vec::new(),
+        });
+        log_step("Preparing extracted project files.");
+        build_project_contents(&build_manifest, &extracted_path, out_path)?;
+        log_step("Creating package from extracted project.");
+        pack_folder(out_path, &build_manifest)
+    })();
+    let cleanup_result = cleanup_output_dir(out_path);
+    let package = match (build_result, cleanup_result) {
+        (Ok(package), Ok(())) => package,
+        (Ok(_), Err(e)) => return Err(e),
+        (Err(e), Ok(())) => return Err(e),
+        (Err(e), Err(cleanup_error)) => {
+            return Err(format!("{} Cleanup failed: {}", e, cleanup_error));
+        }
+    };
     log("Archive build completed successfully.");
     Ok(package)
 }
@@ -813,13 +915,9 @@ pub fn build(path: String) -> i32 {
     let started = Instant::now();
     log_step("Packit build started.");
     let result = (|| -> Result<i32, String> {
-        let manifest = parse_manifest(&path)?;
+        let (manifest, manifest_file_path) = parse_manifest(&path)?;
         match manifest.r#type.as_str() {
-            "PROJECTLOCAL" => {
-                let cwd = std::env::current_dir()
-                    .map_err(|e| format!("Cannot resolve working directory: {}", e))?;
-                Ok(build_project_local(&manifest, &cwd))
-            }
+            "PROJECTLOCAL" => Ok(build_project_local(&manifest, &manifest_file_path)),
             "TARLOCAL" => Ok(build_tar_local(&manifest)),
             "TARREMOTE" => Ok(build_tar_remote(&manifest)),
             _ => Err(format!("Invalid package type '{}'.", manifest.r#type)),
