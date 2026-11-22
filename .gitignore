@@ -1,8 +1,10 @@
 .vscode/
 target/
 packit.out/
+dist/
 
 Cargo.lock
 packit-config.toml
+build.zsh
 
 *.pack
