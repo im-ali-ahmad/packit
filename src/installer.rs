@@ -219,8 +219,8 @@ fn validate_commands(root: &Path, manifest: &Manifest) -> Result<(), String> {
 }
 fn confirm_replacement(name: &str) -> Result<bool, String> {
     let stdin = io::stdin();
-    println!("[packit] Package '{}' is already installed.", name);
-    print!("[packit] Confirm replacement [yes/no]: ");
+    log_warning(format!("Package '{}' is already installed.", name));
+    print!("Confirm replacement [yes/no]: ");
     use std::io::Write;
     io::stdout()
         .flush()

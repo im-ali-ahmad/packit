@@ -20,6 +20,7 @@ const PROGRESS_INTERVAL: u64 = 1024 * 1024;
 struct Manifest {
     r#type: String,
     path: String,
+    prebuild: Option<String>,
     files: Option<Files>,
     commands: Vec<Command>,
     project: Project,
@@ -892,11 +893,53 @@ fn build_tar_remote(manifest: &Manifest) -> i32 {
         }
     }
 }
+fn run_prebuild_command(cmd: &String, manifest_file_path: &Path) -> Result<(), String> {
+    let command = cmd.replace(
+        "$PARENT",
+        &match manifest_file_path.parent() {
+            Some(p) => p,
+            None => return Err("Cannot determine parent directory.".to_string()),
+        }
+        .to_string_lossy(),
+    );
+    for attempt in 1..=2 {
+        print!(
+            "Confirmation ({}/2): Execute bash command `{}`? [yes]: ",
+            attempt, command
+        );
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Cannot flush confirmation prompt: {}", e))?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("Cannot read confirmation: {}", e))?;
+        if input.trim().to_lowercase() != "yes" {
+            return Err("Command execution aborted by user.".into());
+        }
+    }
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .expect("Failed to execute shell command");
+    if !status.success() {
+        return Err(format!("Command exited with error: {}", status));
+    }
+
+    Ok(())
+}
 pub fn build(path: String) -> i32 {
     let started = Instant::now();
     log_step("Packit build started.");
     let result = (|| -> Result<i32, String> {
         let (manifest, manifest_file_path) = parse_manifest(&path)?;
+        if let Some(prebuild) = &manifest.prebuild {
+            match run_prebuild_command(prebuild, &manifest_file_path) {
+                Ok(_) => log_success("Ran prebuild command successfully."),
+                Err(e) => log_error(e),
+            };
+        }
         match manifest.r#type.as_str() {
             "PROJECTLOCAL" => Ok(build_project_local(&manifest, &manifest_file_path)),
             "TARLOCAL" => Ok(build_tar_local(&manifest)),
