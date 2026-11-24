@@ -77,9 +77,38 @@ pub fn find_all() {
         return;
     }
     log_success(format!("Found {} installed packages.", packages.len()));
+    let name_width = packages
+        .iter()
+        .map(|p| p.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let uid_width = packages
+        .iter()
+        .map(|p| p.uid.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let version_width = packages
+        .iter()
+        .map(|p| p.version.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    println!(
+        "{:<name_width$}  {:<uid_width$}  {:<version_width$}  INSTALL DATE",
+        "NAME", "UID", "VERSION"
+    );
+    println!(
+        "{}  {}  {}  {}",
+        "-".repeat(name_width),
+        "-".repeat(uid_width),
+        "-".repeat(version_width),
+        "-".repeat(12)
+    );
     for package in packages {
         println!(
-            "{} {}-{} [{:02}/{:02}/{:04}]",
+            "{:<name_width$}  {:<uid_width$}  {:<version_width$}  {:02}/{:02}/{:04}",
             package.name,
             package.uid,
             package.version,
