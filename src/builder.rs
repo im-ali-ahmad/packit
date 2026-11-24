@@ -542,7 +542,7 @@ fn build_project_contents(
     ));
     Ok(())
 }
-fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
+fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> (i32, Option<PathBuf>) {
     let started = Instant::now();
     log_step("Starting local project build.");
     let project_path = match manifest_file_path
@@ -557,7 +557,7 @@ fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
         Ok(path) => path,
         Err(e) => {
             log_error(e);
-            return 1;
+            return (1, None);
         }
     };
     let out_path = project_path.join("packit.out");
@@ -583,13 +583,13 @@ fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
                 "Total build time: {}.",
                 format_duration(started.elapsed())
             ));
-            0
+            (0, path.clone().into())
         }
         (Ok(path), Err(e)) => {
             log_warning("Build completed with cleanup error.");
             log_log(format!("Package created: {}", path.display()));
             log_error(e);
-            1
+            (1, None)
         }
         (Err(e), cleanup) => {
             log_error(format!("Build failed: {}", e));
@@ -600,7 +600,7 @@ fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
                 "Elapsed time: {}.",
                 format_duration(started.elapsed())
             ));
-            1
+            (1, None)
         }
     }
 }
@@ -724,7 +724,7 @@ fn build_from_archive(
     log_success("Archive build completed successfully.");
     Ok(package)
 }
-fn build_tar_local(manifest: &Manifest) -> i32 {
+fn build_tar_local(manifest: &Manifest) -> (i32, Option<PathBuf>) {
     let started = Instant::now();
     log_step("Starting local TAR build.");
     let result = (|| -> Result<PathBuf, String> {
@@ -759,7 +759,7 @@ fn build_tar_local(manifest: &Manifest) -> i32 {
                 "Total build time: {}.",
                 format_duration(started.elapsed())
             ));
-            0
+            (0, path.clone().into())
         }
         Err(e) => {
             log_error(format!("Local TAR build failed: {}", e));
@@ -767,7 +767,7 @@ fn build_tar_local(manifest: &Manifest) -> i32 {
                 "Elapsed time: {}.",
                 format_duration(started.elapsed())
             ));
-            1
+            (1, None)
         }
     }
 }
@@ -819,9 +819,6 @@ fn download_archive(client: &Client, url: &str, destination: &Path) -> Result<u6
                 while last_percent < percent {
                     last_percent += 1;
                     progress(&"Downloading...".to_string(), last_percent as u8);
-                    io::stdout()
-                        .flush()
-                        .map_err(|e| format!("Cannot flush progress output: {}", e))?;
                 }
             }
             _ if downloaded.saturating_sub(last_reported) >= PROGRESS_INTERVAL => {
@@ -850,7 +847,7 @@ fn download_archive(client: &Client, url: &str, destination: &Path) -> Result<u6
     log_success(format!("Download completed: {}.", format_size(downloaded)));
     Ok(downloaded)
 }
-fn build_tar_remote(manifest: &Manifest) -> i32 {
+fn build_tar_remote(manifest: &Manifest) -> (i32, Option<PathBuf>) {
     let started = Instant::now();
     log_step("Starting remote TAR build.");
     let result = (|| -> Result<PathBuf, String> {
@@ -881,7 +878,7 @@ fn build_tar_remote(manifest: &Manifest) -> i32 {
                 "Total build time: {}.",
                 format_duration(started.elapsed())
             ));
-            0
+            (0, path.clone().into())
         }
         Err(e) => {
             log_error(format!("Remote TAR build failed: {}", e));
@@ -889,7 +886,7 @@ fn build_tar_remote(manifest: &Manifest) -> i32 {
                 "Elapsed time: {}.",
                 format_duration(started.elapsed())
             ));
-            1
+            (1, None)
         }
     }
 }
@@ -929,10 +926,10 @@ fn run_prebuild_command(cmd: &String, manifest_file_path: &Path) -> Result<(), S
 
     Ok(())
 }
-pub fn build(path: String) -> i32 {
+pub fn build(path: String) -> (i32, Option<PathBuf>) {
     let started = Instant::now();
     log_step("Packit build started.");
-    let result = (|| -> Result<i32, String> {
+    let result = (|| -> Result<(i32, Option<PathBuf>), String> {
         let (manifest, manifest_file_path) = parse_manifest(&path)?;
         if let Some(prebuild) = &manifest.prebuild {
             match run_prebuild_command(prebuild, &manifest_file_path) {
@@ -951,10 +948,10 @@ pub fn build(path: String) -> i32 {
         Ok(code) => code,
         Err(e) => {
             log_error(format!("Build failed: {}", e));
-            1
+            (1, None)
         }
     };
-    if code == 0 {
+    if code.0 == 0 {
         log_success(format!(
             "Packit finished successfully in {}.",
             format_duration(started.elapsed())
@@ -962,7 +959,7 @@ pub fn build(path: String) -> i32 {
     } else {
         log_error(format!(
             "Packit finished with exit code {} in {}.",
-            code,
+            code.0,
             format_duration(started.elapsed())
         ));
     }

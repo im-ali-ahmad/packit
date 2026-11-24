@@ -1,13 +1,15 @@
 use crate::{installed_manifest::Package, installer_manifest::*, utils::*};
 use chrono::{Datelike, Local};
 use flate2::read::GzDecoder;
+use reqwest::blocking::Client;
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashSet,
     fs::{self, File, Permissions},
-    io::{self, Read},
+    io::{self, Read, Write},
     os::unix::fs::{PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 use tar::Archive;
 use tempfile::Builder;
@@ -17,6 +19,8 @@ const MAX_EXTRACTED_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 const INSTALL_DIR: &str = ".local/packit.opt";
 const BIN_DIR: &str = ".local/bin";
 const INSTALL_MANIFEST: &str = "packit-manifest.toml";
+const DOWNLOAD_TIMEOUT: u64 = 300;
+const PROGRESS_INTERVAL: u64 = 1024 * 1024;
 fn valid_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
@@ -479,6 +483,116 @@ pub fn install(path: String) -> i32 {
         Err(error) => {
             log_error(format!("Installation failed: {}", error));
             1
+        }
+    }
+}
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{:.2} {}", size, UNITS[unit])
+}
+fn download_archive(client: &Client, url: &str, destination: &Path) -> Result<u64, String> {
+    log_step(format!("Downloading '{}'.", url));
+    let mut response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("Cannot download remote archive: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Remote server returned HTTP status {}.",
+            response.status()
+        ));
+    }
+    let content_length = response.content_length();
+    if let Some(length) = content_length {
+        if length > MAX_ARCHIVE_SIZE {
+            return Err("Remote archive exceeds the maximum allowed size.".into());
+        }
+        log_log(format!("Remote file size: {}", format_size(length)));
+    } else {
+        log_warning("Remote file size is unknown.");
+    }
+    let mut file = File::create(destination)
+        .map_err(|e| format!("Cannot create downloaded archive: {}", e))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    let mut last_percent = 0u64;
+    let mut last_reported = 0u64;
+    loop {
+        let count = response
+            .read(&mut buffer)
+            .map_err(|e| format!("Download interrupted: {}", e))?;
+        if count == 0 {
+            break;
+        }
+        downloaded = downloaded
+            .checked_add(count as u64)
+            .ok_or_else(|| "Download size overflow.".to_string())?;
+        if downloaded > MAX_ARCHIVE_SIZE {
+            return Err("Downloaded archive exceeds the maximum allowed size.".into());
+        }
+        file.write_all(&buffer[..count])
+            .map_err(|e| format!("Cannot write downloaded archive: {}", e))?;
+        match content_length {
+            Some(total) if total > 0 => {
+                let percent = (downloaded.saturating_mul(100) / total).min(100);
+                while last_percent < percent {
+                    last_percent += 1;
+                    progress(&"Downloading...".to_string(), last_percent as u8);
+                }
+            }
+            _ if downloaded.saturating_sub(last_reported) >= PROGRESS_INTERVAL => {
+                log_log(format!("Downloaded: {}", format_size(downloaded)));
+                last_reported = downloaded;
+            }
+            _ => {}
+        }
+    }
+    file.flush()
+        .map_err(|e| format!("Cannot flush downloaded archive: {}", e))?;
+    if let Some(total) = content_length {
+        if downloaded != total {
+            return Err(format!(
+                "Incomplete download: expected {}, received {}.",
+                format_size(total),
+                format_size(downloaded)
+            ));
+        }
+        while last_percent < 100 {
+            last_percent += 1;
+            progress(&"Downloading...".to_string(), last_percent as u8);
+        }
+        println!();
+    }
+    log_success(format!("Download completed: {}.", format_size(downloaded)));
+    Ok(downloaded)
+}
+fn install_remote_download(url: String) -> Result<(tempfile::TempDir, PathBuf), String> {
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("Cannot create HTTP client: {e}"))?;
+    log_success("HTTP client ready.");
+    log_step("Creating temporary download directory.");
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| format!("Cannot create temporary directory: {e}"))?;
+    let archive_path = temp_dir.path().join("remote.tar.gz");
+    download_archive(&client, &url, &archive_path)?;
+    Ok((temp_dir, archive_path))
+}
+pub fn install_remote(url: String) -> i32 {
+    match install_remote_download(url) {
+        Ok((_temp_dir, archive_path)) => install(archive_path.to_string_lossy().to_string()),
+        Err(e) => {
+            log_error(e);
+            return 1;
         }
     }
 }
