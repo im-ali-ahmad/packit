@@ -77,20 +77,22 @@ fn parse_version(manifest: &mut Manifest, parent: &Path) -> Result<Manifest, Str
     {
         let parent = parent
             .canonicalize()
-            .map_err(|e| format!("Cannot resolve PARENT directory: {}", e))?
+            .map_err(|e| format!("Cannot resolve parent directory: {}", e))?
             .to_string_lossy()
             .into_owned();
         let cmd = raw_cmd.replace("$PARENT", &parent);
         for attempt in 1..=2 {
             print!(
-                "Confirmation ({}/2): Execute bash command `{}`? [yes??]: ",
+                "Confirmation ({}/2): Execute bash command `{}`? [yes]: ",
                 attempt, cmd
             );
-            io::stdout().flush().map_err(|e| e.to_string())?;
+            io::stdout()
+                .flush()
+                .map_err(|e| format!("Cannot flush confirmation prompt: {}", e))?;
             let mut input = String::new();
             io::stdin()
                 .read_line(&mut input)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Cannot read confirmation: {}", e))?;
             if input.trim().to_lowercase() != "yes" {
                 return Err("Command execution aborted by user.".into());
             }
@@ -101,8 +103,10 @@ fn parse_version(manifest: &mut Manifest, parent: &Path) -> Result<Manifest, Str
             .output()
             .map_err(|e| format!("Failed to execute bash: {}", e))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Bash command failed: {}", stderr.trim()));
+            return Err(format!(
+                "Bash command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if stdout.is_empty() {
@@ -120,11 +124,11 @@ fn parse_manifest(path: &str) -> Result<(Manifest, PathBuf), String> {
         toml::from_str(&content).map_err(|e| format!("Invalid manifest: {}", e))?;
     let manifest_path =
         fs::canonicalize(path).map_err(|e| format!("Cannot resolve manifest path: {}", e))?;
-    log("Manifest loaded successfully.");
-    log(format!("Package type: {}", manifest.r#type));
-    log(format!("Project: {}", manifest.project.name));
-    log(format!("Version: {}", manifest.project.version));
-    log(format!("UID: {}", manifest.project.uid));
+    log_success("Manifest loaded successfully.");
+    log_log(format!("Package type: {}", manifest.r#type));
+    log_log(format!("Project: {}", manifest.project.name));
+    log_log(format!("Version: {}", manifest.project.version));
+    log_log(format!("UID: {}", manifest.project.uid));
     Ok((manifest, manifest_path))
 }
 fn validate_relative_path(path: &str) -> Result<PathBuf, String> {
@@ -173,11 +177,11 @@ fn cleanup_output_dir(path: &Path) -> Result<(), String> {
     }
     fs::remove_dir_all(path)
         .map_err(|e| format!("Cannot remove output '{}': {}", path.display(), e))?;
-    log(format!("Removed temporary output '{}'.", path.display()));
+    log_success(format!("Removed temporary output '{}'.", path.display()));
     Ok(())
 }
 fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
-    log(format!(
+    log_step(format!(
         "Copying directory '{}' -> '{}'.",
         src.display(),
         dest.display()
@@ -230,7 +234,7 @@ fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
     }
     let total_files = files.len();
     let total_size: u64 = files.iter().map(|(_, _, size)| *size).sum();
-    log(format!(
+    log_step(format!(
         "Copying {} files ({}).",
         total_files,
         format_size(total_size)
@@ -256,7 +260,7 @@ fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
     for result in results {
         result?;
     }
-    log(format!(
+    log_success(format!(
         "Copied {} of {} files ({}).",
         copied.load(std::sync::atomic::Ordering::Relaxed),
         total_files,
@@ -305,7 +309,7 @@ fn append_directory(archive: &mut Builder<GzEncoder<File>>, src: &Path) -> Resul
             return Err(format!("Unsupported file type: '{}'.", path.display()));
         }
     }
-    log(format!(
+    log_step(format!(
         "Archiving {} files and {} directories ({}).",
         files.len(),
         directories.len(),
@@ -332,21 +336,15 @@ fn append_directory(archive: &mut Builder<GzEncoder<File>>, src: &Path) -> Resul
         };
         while last_percent < percent {
             last_percent += 1;
-            log_in_same_line(format!(
-                "Archive progress: {}% ({}/{})\r",
-                last_percent,
-                format_size(processed),
-                format_size(total_size)
-            ));
-            std::io::stdout()
-                .flush()
-                .map_err(|e| format!("Cannot flush progress output: {}", e))?;
+            progress(&"Archiving...".to_string(), last_percent as u8);
         }
     }
     if last_percent == 0 {
-        log("\nArchive progress: 100%.");
+        log_success("Archive completed.");
+    } else {
+        println!();
     }
-    log("Archive entries written successfully.");
+    log_success("Archive entries written successfully.");
     Ok(())
 }
 fn pack_folder(src: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
@@ -369,14 +367,14 @@ fn pack_folder(src: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
         .to_path_buf();
     let manifest_file = src.join("packit-manifest.toml");
     if manifest_file.exists() {
-        log("Removing previous installer manifest.");
+        log_warning("Removing previous installer manifest.");
         fs::remove_file(&manifest_file)
             .map_err(|e| format!("Cannot remove previous manifest: {}", e))?;
     }
     log_step("Validating command files.");
     let mut commands = Vec::with_capacity(manifest.commands.len());
     for command in &manifest.commands {
-        log(format!(
+        log_step(format!(
             "Checking command '{}': {}",
             command.name, command.file
         ));
@@ -394,7 +392,7 @@ fn pack_folder(src: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
     }
     log_step("Calculating project hash.");
     let hash = hash_directory(&src).map_err(|e| format!("Cannot hash project directory: {}", e))?;
-    log(format!("Project hash: {}", hash));
+    log_log(format!("Project hash: {}", hash));
     let install_manifest = installer_manifest::Manifest {
         commands,
         project: installer_manifest::Project {
@@ -411,7 +409,7 @@ fn pack_folder(src: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
     let serialized = toml::to_string(&install_manifest)
         .map_err(|e| format!("Cannot serialize manifest: {}", e))?;
     fs::write(&manifest_file, serialized).map_err(|e| format!("Cannot write manifest: {}", e))?;
-    log(format!(
+    log_success(format!(
         "Installer manifest created: '{}'.",
         manifest_file.display()
     ));
@@ -443,9 +441,9 @@ fn pack_folder(src: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
     let size = fs::metadata(&output_path)
         .map_err(|e| format!("Cannot read package metadata: {}", e))?
         .len();
-    log(format!("Package: {}", output_path.display()));
-    log(format!("Package size: {}", format_size(size)));
-    log(format!(
+    log_log(format!("Package: {}", output_path.display()));
+    log_log(format!("Package size: {}", format_size(size)));
+    log_success(format!(
         "Packaging completed in {}.",
         format_duration(started.elapsed())
     ));
@@ -461,12 +459,12 @@ fn prepare_output_dir(path: &Path) -> Result<(), String> {
                 path.display()
             ));
         }
-        log("Removing previous output directory.");
+        log_warning("Removing previous output directory.");
         fs::remove_dir_all(path)
             .map_err(|e| format!("Cannot remove previous output directory: {}", e))?;
     }
     fs::create_dir_all(path).map_err(|e| format!("Cannot create output directory: {}", e))?;
-    log("Output directory ready.");
+    log_success("Output directory ready.");
     Ok(())
 }
 fn build_project_contents(
@@ -486,7 +484,7 @@ fn build_project_contents(
     if !project_path.is_dir() {
         return Err("Project path is not a directory.".into());
     }
-    log(format!("Project base: {}", project_path.display()));
+    log_log(format!("Project base: {}", project_path.display()));
     log_step("Resolving base files.");
     let base_path = resolve_path(&project_path, &files.base)?;
     if !base_path.is_dir() {
@@ -495,13 +493,13 @@ fn build_project_contents(
             base_path.display()
         ));
     }
-    log(format!("Base directory: {}", base_path.display()));
+    log_log(format!("Base directory: {}", base_path.display()));
     prepare_output_dir(out_path)?;
     log_step("Copying base files.");
     copy_dir_content(&base_path, out_path)?;
     log_step("Copying extra files.");
     for (index, extra) in files.extra.iter().enumerate() {
-        log(format!(
+        log_log(format!(
             "Extra file {}/{}: {} -> {}",
             index + 1,
             files.extra.len(),
@@ -532,12 +530,12 @@ fn build_project_contents(
                     e
                 )
             })?;
-            log(format!("Copied {}.", format_size(size)));
+            log_success(format!("Copied {}.", format_size(size)));
         } else {
             return Err(format!("Unsupported extra file '{}'.", source.display()));
         }
     }
-    log(format!(
+    log_success(format!(
         "Project files prepared in {}.",
         format_duration(started.elapsed())
     ));
@@ -557,8 +555,7 @@ fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
         }) {
         Ok(path) => path,
         Err(e) => {
-            log_step("Build failed.");
-            log(e);
+            log_error(e);
             return 1;
         }
     };
@@ -570,7 +567,7 @@ fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
                 project_path.display()
             ));
         }
-        log(format!("Project directory: {}", project_path.display()));
+        log_log(format!("Project directory: {}", project_path.display()));
         let mut local_manifest = manifest.clone();
         let local_manifest = parse_version(&mut local_manifest, &project_path)?;
         build_project_contents(&local_manifest, &project_path, &out_path)?;
@@ -579,27 +576,26 @@ fn build_project_local(manifest: &Manifest, manifest_file_path: &Path) -> i32 {
     let cleanup_result = cleanup_output_dir(&out_path);
     match (result, cleanup_result) {
         (Ok(path), Ok(())) => {
-            log_step("Build completed successfully.");
-            log(format!("Package created: {}", path.display()));
-            log(format!(
+            log_success("Build completed successfully.");
+            log_log(format!("Package created: {}", path.display()));
+            log_log(format!(
                 "Total build time: {}.",
                 format_duration(started.elapsed())
             ));
             0
         }
         (Ok(path), Err(e)) => {
-            log_step("Build completed with cleanup error.");
-            log(format!("Package created: {}", path.display()));
-            log(e);
+            log_warning("Build completed with cleanup error.");
+            log_log(format!("Package created: {}", path.display()));
+            log_error(e);
             1
         }
         (Err(e), cleanup) => {
-            log_step("Build failed.");
-            log(e);
+            log_error(format!("Build failed: {}", e));
             if let Err(cleanup_error) = cleanup {
-                log(format!("Cleanup failed: {}", cleanup_error));
+                log_error(format!("Cleanup failed: {}", cleanup_error));
             }
-            log(format!(
+            log_log(format!(
                 "Elapsed time: {}.",
                 format_duration(started.elapsed())
             ));
@@ -654,8 +650,8 @@ fn validate_archive(archive: &mut Archive<GzDecoder<File>>) -> Result<u64, Strin
         }
         count += 1;
     }
-    log(format!("Validated {} archive entries.", count));
-    log(format!(
+    log_success(format!("Validated {} archive entries.", count));
+    log_log(format!(
         "Total extracted size: {}.",
         format_size(total_size)
     ));
@@ -677,8 +673,8 @@ fn build_from_archive(
     if archive_size > MAX_ARCHIVE_SIZE {
         return Err("Archive exceeds the maximum allowed size.".into());
     }
-    log(format!("Archive: {}", archive_path.display()));
-    log(format!("Archive size: {}", format_size(archive_size)));
+    log_log(format!("Archive: {}", archive_path.display()));
+    log_log(format!("Archive size: {}", format_size(archive_size)));
     log_step("Checking archive integrity and safety.");
     let archive_file =
         File::open(archive_path).map_err(|e| format!("Cannot open archive: {}", e))?;
@@ -689,7 +685,7 @@ fn build_from_archive(
     let temp_dir =
         tempfile::tempdir().map_err(|e| format!("Cannot create temporary directory: {}", e))?;
     let extracted_path = temp_dir.path().to_path_buf();
-    log(format!(
+    log_log(format!(
         "Extraction directory: {}",
         extracted_path.display()
     ));
@@ -701,7 +697,7 @@ fn build_from_archive(
     archive
         .unpack(&extracted_path)
         .map_err(|e| format!("Cannot extract archive: {}", e))?;
-    log("Archive extracted successfully.");
+    log_success("Archive extracted successfully.");
     let mut local_manifest = manifest.clone();
     let local_manifest = parse_version(&mut local_manifest, &extracted_path)?;
     let build_result = (|| -> Result<PathBuf, String> {
@@ -724,7 +720,7 @@ fn build_from_archive(
             return Err(format!("{} Cleanup failed: {}", e, cleanup_error));
         }
     };
-    log("Archive build completed successfully.");
+    log_success("Archive build completed successfully.");
     Ok(package)
 }
 fn build_tar_local(manifest: &Manifest) -> i32 {
@@ -746,9 +742,9 @@ fn build_tar_local(manifest: &Manifest) -> i32 {
             .parent()
             .ok_or_else(|| "Cannot resolve archive parent directory.".to_string())?;
         let out_path = parent.join("packit.out");
-        log(format!("Archive parent: {}", parent.display()));
-        log(format!("Output directory: {}", out_path.display()));
-        log(format!(
+        log_log(format!("Archive parent: {}", parent.display()));
+        log_log(format!("Output directory: {}", out_path.display()));
+        log_log(format!(
             "Final package will be saved in: {}",
             parent.display()
         ));
@@ -756,18 +752,17 @@ fn build_tar_local(manifest: &Manifest) -> i32 {
     })();
     match result {
         Ok(path) => {
-            log_step("Local TAR build completed successfully.");
-            log(format!("Package created: {}", path.display()));
-            log(format!(
+            log_success("Local TAR build completed successfully.");
+            log_log(format!("Package created: {}", path.display()));
+            log_log(format!(
                 "Total build time: {}.",
                 format_duration(started.elapsed())
             ));
             0
         }
         Err(e) => {
-            log_step("Local TAR build failed.");
-            log(e);
-            log(format!(
+            log_error(format!("Local TAR build failed: {}", e));
+            log_log(format!(
                 "Elapsed time: {}.",
                 format_duration(started.elapsed())
             ));
@@ -792,9 +787,9 @@ fn download_archive(client: &Client, url: &str, destination: &Path) -> Result<u6
         if length > MAX_ARCHIVE_SIZE {
             return Err("Remote archive exceeds the maximum allowed size.".into());
         }
-        log(format!("Remote file size: {}", format_size(length)));
+        log_log(format!("Remote file size: {}", format_size(length)));
     } else {
-        log("Remote file size is unknown.");
+        log_warning("Remote file size is unknown.");
     }
     let mut file = File::create(destination)
         .map_err(|e| format!("Cannot create downloaded archive: {}", e))?;
@@ -822,19 +817,14 @@ fn download_archive(client: &Client, url: &str, destination: &Path) -> Result<u6
                 let percent = (downloaded.saturating_mul(100) / total).min(100);
                 while last_percent < percent {
                     last_percent += 1;
-                    log_in_same_line(format!(
-                        "Download progress: {}% ({}/{})\r",
-                        last_percent,
-                        format_size(downloaded),
-                        format_size(total)
-                    ));
-                    std::io::stdout()
+                    progress(&"Downloading...".to_string(), last_percent as u8);
+                    io::stdout()
                         .flush()
                         .map_err(|e| format!("Cannot flush progress output: {}", e))?;
                 }
             }
             _ if downloaded.saturating_sub(last_reported) >= PROGRESS_INTERVAL => {
-                log(format!("Downloaded: {}", format_size(downloaded)));
+                log_log(format!("Downloaded: {}", format_size(downloaded)));
                 last_reported = downloaded;
             }
             _ => {}
@@ -852,19 +842,11 @@ fn download_archive(client: &Client, url: &str, destination: &Path) -> Result<u6
         }
         while last_percent < 100 {
             last_percent += 1;
-            log_in_same_line(format!(
-                "Download progress: {}% ({}/{})\r",
-                last_percent,
-                format_size(downloaded),
-                format_size(total)
-            ));
-            std::io::stdout()
-                .flush()
-                .map_err(|e| format!("Cannot flush progress output: {}", e))?;
+            progress(&"Downloading...".to_string(), last_percent as u8);
         }
         println!();
     }
-    log(format!("Download completed: {}.", format_size(downloaded)));
+    log_success(format!("Download completed: {}.", format_size(downloaded)));
     Ok(downloaded)
 }
 fn build_tar_remote(manifest: &Manifest) -> i32 {
@@ -878,7 +860,7 @@ fn build_tar_remote(manifest: &Manifest) -> i32 {
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .map_err(|e| format!("Cannot create HTTP client: {}", e))?;
-        log("HTTP client ready.");
+        log_success("HTTP client ready.");
         log_step("Creating temporary download directory.");
         let temp_dir =
             tempfile::tempdir().map_err(|e| format!("Cannot create temporary directory: {}", e))?;
@@ -886,24 +868,23 @@ fn build_tar_remote(manifest: &Manifest) -> i32 {
         download_archive(&client, &manifest.path, &archive_path)?;
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         let out_path = cwd.join("packit.out");
-        log(format!("Output directory: {}", out_path.display()));
-        log(format!("Final package will be saved in: {}", cwd.display()));
+        log_log(format!("Output directory: {}", out_path.display()));
+        log_log(format!("Final package will be saved in: {}", cwd.display()));
         build_from_archive(manifest, &archive_path, &out_path)
     })();
     match result {
         Ok(path) => {
-            log_step("Remote TAR build completed successfully.");
-            log(format!("Package created: {}", path.display()));
-            log(format!(
+            log_success("Remote TAR build completed successfully.");
+            log_log(format!("Package created: {}", path.display()));
+            log_log(format!(
                 "Total build time: {}.",
                 format_duration(started.elapsed())
             ));
             0
         }
         Err(e) => {
-            log_step("Remote TAR build failed.");
-            log(e);
-            log(format!(
+            log_error(format!("Remote TAR build failed: {}", e));
+            log_log(format!(
                 "Elapsed time: {}.",
                 format_duration(started.elapsed())
             ));
@@ -926,15 +907,21 @@ pub fn build(path: String) -> i32 {
     let code = match result {
         Ok(code) => code,
         Err(e) => {
-            log_step("Build failed.");
-            log(e);
+            log_error(format!("Build failed: {}", e));
             1
         }
     };
-    log(format!(
-        "Packit finished with exit code {} in {}.",
-        code,
-        format_duration(started.elapsed())
-    ));
+    if code == 0 {
+        log_success(format!(
+            "Packit finished successfully in {}.",
+            format_duration(started.elapsed())
+        ));
+    } else {
+        log_error(format!(
+            "Packit finished with exit code {} in {}.",
+            code,
+            format_duration(started.elapsed())
+        ));
+    }
     code
 }

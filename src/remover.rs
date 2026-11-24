@@ -1,15 +1,48 @@
 use crate::finder::find_raw;
-use crate::utils::log;
+use crate::utils::*;
 use std::{
     collections::BTreeSet,
     env, fs, io,
     path::{Component, Path, PathBuf},
 };
+fn is_safe_install_path(path: &Path, install_root: &Path) -> bool {
+    if !path.is_absolute()
+        || !path.starts_with(install_root)
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return false;
+    }
+    let mut current = install_root.to_path_buf();
+    if let Ok(metadata) = fs::symlink_metadata(&current) {
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+    }
+    let relative = match path.strip_prefix(install_root) {
+        Ok(relative) => relative,
+        Err(_) => return false,
+    };
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component);
+        if components.peek().is_some() {
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => return false,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
 pub fn remove(package: String) -> i32 {
     let pack = match find_raw(package) {
         Ok(pack) => pack,
-        Err(err) => {
-            log(format!("Error: {}", err));
+        Err(error) => {
+            log_error(error);
             return 1;
         }
     };
@@ -22,38 +55,42 @@ pub fn remove(package: String) -> i32 {
     );
     let stdin = io::stdin();
     for attempt in 1..=2 {
-        log(format!(
+        log_warning(format!(
             "Confirm removal ({}/2). Type 'yes' to continue:",
             attempt
         ));
         let mut input = String::new();
-        if let Err(e) = stdin.read_line(&mut input) {
-            log(format!("Cannot read confirmation: {}", e));
+        if let Err(error) = stdin.read_line(&mut input) {
+            log_error(format!("Cannot read confirmation: {}", error));
             return 1;
         }
         if !input.trim().eq_ignore_ascii_case("yes") {
-            log("Removal cancelled.");
+            log_warning("Removal cancelled.");
             return 1;
         }
     }
     let home = match env::var_os("HOME") {
         Some(home) => PathBuf::from(home),
         None => {
-            log("Cannot determine home directory.");
+            log_error("Cannot determine home directory.");
             return 1;
         }
     };
-    let install_root = home.join(".local/packit.opt").join(&pack.uid);
-    log(format!("Removing package '{}'...", pack.uid));
+    let uid = Path::new(&pack.uid);
+    if uid.components().count() != 1
+        || !matches!(uid.components().next(), Some(Component::Normal(_)))
+    {
+        log_error("Invalid package UID.");
+        return 1;
+    }
+    let install_root = home.join(".local/packit.opt").join(uid);
+    log_step(format!("Removing package '{}'...", pack.uid));
     let mut success = true;
     let mut directories = BTreeSet::new();
     for filename in &pack.files {
         let path = Path::new(filename);
-        if !path.is_absolute()
-            || !path.starts_with(&install_root)
-            || path.components().any(|c| matches!(c, Component::ParentDir))
-        {
-            log(format!("Skipping invalid installation path: {}", filename));
+        if !is_safe_install_path(path, &install_root) {
+            log_warning(format!("Skipping invalid installation path: {}", filename));
             success = false;
             continue;
         }
@@ -61,23 +98,20 @@ pub fn remove(package: String) -> i32 {
             let mut current = parent.to_path_buf();
             while current.starts_with(&install_root) {
                 directories.insert(current.clone());
-                if current == install_root {
-                    break;
-                }
-                if !current.pop() {
+                if current == install_root || !current.pop() {
                     break;
                 }
             }
         }
         match fs::remove_file(path) {
             Ok(()) => {
-                log(format!("Removed: {}", filename));
+                log_success(format!("Removed: {}", filename));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                log(format!("Already missing: {}", filename));
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log_warning(format!("Already missing: {}", filename));
             }
-            Err(e) => {
-                log(format!("Cannot remove '{}': {}", filename, e));
+            Err(error) => {
+                log_error(format!("Cannot remove '{}': {}", filename, error));
                 success = false;
             }
         }
@@ -85,28 +119,29 @@ pub fn remove(package: String) -> i32 {
     for directory in directories.iter().rev() {
         match fs::remove_dir(directory) {
             Ok(()) => {
-                log(format!("Removed empty directory: {}", directory.display()));
+                log_success(format!("Removed empty directory: {}", directory.display()));
             }
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                log(format!(
+            Err(error)
+                if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                    || error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                log_error(format!(
                     "Cannot remove directory '{}': {}",
                     directory.display(),
-                    e
+                    error
                 ));
                 success = false;
             }
         }
     }
     if success {
-        log(format!("Package '{}' removed successfully.", pack.uid));
-        return 0;
+        log_success(format!("Package '{}' removed successfully.", pack.uid));
+        0
     } else {
-        log(format!(
+        log_warning(format!(
             "Package '{}' was only partially removed.",
             pack.uid
         ));
-        return 1;
+        1
     }
 }

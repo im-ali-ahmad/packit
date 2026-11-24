@@ -1,12 +1,13 @@
-use crate::installed_manifest::Package;
+use crate::{installed_manifest::Package, utils::*};
 use std::{fs, path::PathBuf};
 const INSTALL_DIR: &str = ".local/packit.opt";
 const INSTALL_MANIFEST: &str = "packit-manifest.toml";
 pub fn find_all() {
+    log_step("Searching installed packages.");
     let home = match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home),
         None => {
-            println!("Cannot determine HOME directory.");
+            log_error("Cannot determine HOME directory.");
             return;
         }
     };
@@ -14,7 +15,7 @@ pub fn find_all() {
     let entries = match fs::read_dir(&install_root) {
         Ok(entries) => entries,
         Err(e) => {
-            println!("Cannot access installed packages: {}", e);
+            log_error(format!("Cannot access installed packages: {}", e));
             return;
         }
     };
@@ -23,46 +24,59 @@ pub fn find_all() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                println!("Cannot read directory entry: {}", e);
+                log_warning(format!("Cannot read directory entry: {}", e));
                 continue;
             }
         };
-        let metadata = match fs::symlink_metadata(entry.path()) {
+        let entry_path = entry.path();
+        let metadata = match fs::symlink_metadata(&entry_path) {
             Ok(metadata) => metadata,
             Err(e) => {
-                println!("Cannot inspect '{}': {}", entry.path().display(), e);
+                log_warning(format!("Cannot inspect '{}': {}", entry_path.display(), e));
                 continue;
             }
         };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        let manifest_path = entry.path().join(INSTALL_MANIFEST);
+        let manifest_path = entry_path.join(INSTALL_MANIFEST);
         let content = match fs::read_to_string(&manifest_path) {
             Ok(content) => content,
             Err(e) => {
-                println!("Cannot read manifest '{}': {}", manifest_path.display(), e);
+                log_warning(format!(
+                    "Cannot read manifest '{}': {}",
+                    manifest_path.display(),
+                    e
+                ));
                 continue;
             }
         };
         let package: Package = match toml::from_str(&content) {
             Ok(package) => package,
             Err(e) => {
-                println!("Invalid manifest '{}': {}", manifest_path.display(), e);
+                log_warning(format!(
+                    "Invalid manifest '{}': {}",
+                    manifest_path.display(),
+                    e
+                ));
                 continue;
             }
         };
         if package.uid != entry.file_name().to_string_lossy() {
-            println!("UID mismatch in '{}'. Skipping.", manifest_path.display());
+            log_warning(format!(
+                "UID mismatch in '{}'. Skipping.",
+                manifest_path.display()
+            ));
             continue;
         }
         packages.push(package);
     }
     packages.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     if packages.is_empty() {
-        println!("No packages installed.");
+        log_warning("No packages installed.");
         return;
     }
+    log_success(format!("Found {} installed packages.", packages.len()));
     for package in packages {
         println!(
             "{} {}-{} [{:02}/{:02}/{:04}]",
@@ -77,13 +91,13 @@ pub fn find_all() {
 }
 pub fn find_raw(package: String) -> Result<Package, String> {
     if package.is_empty()
+        || package == "."
+        || package == ".."
         || !package
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        || package == "."
-        || package == ".."
     {
-        return Err("Invalid package UID.".to_string());
+        return Err("Invalid package UID.".into());
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -92,7 +106,7 @@ pub fn find_raw(package: String) -> Result<Package, String> {
     let root_metadata = fs::symlink_metadata(&install_root)
         .map_err(|e| format!("Cannot access installed packages: {}", e))?;
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err("Invalid installation directory.".to_string());
+        return Err("Invalid installation directory.".into());
     }
     let package_dir = install_root.join(&package);
     let package_metadata = fs::symlink_metadata(&package_dir)
@@ -104,20 +118,22 @@ pub fn find_raw(package: String) -> Result<Package, String> {
     let manifest_metadata = fs::symlink_metadata(&manifest_path)
         .map_err(|_| format!("Package manifest '{}' was not found.", package))?;
     if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
-        return Err("Invalid package manifest.".to_string());
+        return Err("Invalid package manifest.".into());
     }
     let content = fs::read_to_string(&manifest_path)
         .map_err(|e| format!("Cannot read package manifest: {}", e))?;
     let item: Package =
         toml::from_str(&content).map_err(|e| format!("Invalid package manifest: {}", e))?;
     if item.uid != package {
-        return Err("Package UID does not match its installation directory.".to_string());
+        return Err("Package UID does not match its installation directory.".into());
     }
     Ok(item)
 }
 pub fn find(package: String) -> i32 {
+    log_step(format!("Searching for package '{}'.", package));
     match find_raw(package) {
         Ok(item) => {
+            log_success("Package found.");
             println!("Name:         {}", item.name);
             println!("UID:          {}", item.uid);
             println!("Version:      {}", item.version);
@@ -132,7 +148,7 @@ pub fn find(package: String) -> i32 {
             0
         }
         Err(msg) => {
-            println!("{}", msg);
+            log_error(msg);
             1
         }
     }

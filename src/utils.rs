@@ -1,3 +1,4 @@
+use colored::Colorize;
 use sha2::{
     Digest, Sha512, digest::array::Array, digest::consts::B0, digest::consts::B1,
     digest::typenum::UInt, digest::typenum::UTerm,
@@ -5,10 +6,11 @@ use sha2::{
 use std::{
     borrow::Cow,
     fs::{File, FileType},
-    io::{Error as IoError, Read, Result},
+    io::{Error as IoError, Read, Result, Write, stdout},
     path::{Path, PathBuf},
     result::Result as StdResult,
 };
+use terminal_size::{Height, Width, terminal_size};
 use walkdir::{DirEntry, Error, WalkDir};
 pub fn hash_directory(root: &Path) -> Result<String> {
     let mut entries: Vec<DirEntry> = WalkDir::new(root)
@@ -56,12 +58,43 @@ pub fn hash_directory(root: &Path) -> Result<String> {
     > = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{:02x}", b)).collect())
 }
-pub fn log(message: impl std::fmt::Display) {
-    println!("[packit] {}", message);
+pub fn log_success(message: impl std::fmt::Display) {
+    println!("{} {}", "[SUCCESS]".green(), message);
 }
-pub fn log_in_same_line(message: impl std::fmt::Display) {
-    print!("[packit] {}", message);
+pub fn log_error(message: impl std::fmt::Display) {
+    println!("{} {}", "[ ERROR ]".red(), message);
+}
+pub fn log_warning(message: impl std::fmt::Display) {
+    println!("{} {}", "[WARNING]".yellow(), message);
 }
 pub fn log_step(message: impl std::fmt::Display) {
-    println!("\n[packit] {}", message);
+    println!("{} {}", "[ STEP  ]".purple(), message);
+}
+pub fn log_log(message: impl std::fmt::Display) {
+    println!("{} {}", "[ INFO  ]".blue(), message);
+}
+pub fn progress(what: &str, percent: u8) {
+    let Some((Width(w), Height(_))) = terminal_size() else {
+        return;
+    };
+    let percent = percent.min(100);
+    let label_len = what.chars().count();
+    let overhead = label_len + 8;
+    let w = w as usize;
+    if w <= overhead {
+        print!("\r\x1b[2K{} {:>3}%", what, percent);
+        let _ = stdout().flush();
+        return;
+    }
+    let bar_width = w - overhead;
+    let filled = (bar_width * percent as usize) / 100;
+    let empty = bar_width - filled;
+    print!(
+        "\r\x1b[2K{} [{}{}] {:>3}%",
+        what,
+        "▮".repeat(filled),
+        "▯".repeat(empty),
+        percent
+    );
+    let _ = stdout().flush();
 }

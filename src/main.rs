@@ -7,6 +7,7 @@ mod installer_manifest;
 mod remover;
 mod utils;
 use std::{env::args, process::exit};
+use utils::*;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn print_help() {
     println!(
@@ -25,8 +26,8 @@ COMMANDS:
     build <MANIFEST_FILE>         Build a distributable package from a manifest
     install <PACKAGE_FILE>        Install a built package
     remove <PACKAGE_UID>          Uninstall an installed package
-    search [PACKAGE_UID]          Display an installed package's details or list all installed packages
-
+    search [PACKAGE_UID]          Display package details or list installed packages
+    list                          List all installed packages
     version [--only-numbers]      Display the current version of Packit
     help                          Display this help message
 
@@ -47,43 +48,42 @@ EXAMPLES:
     packit help"
     );
 }
+fn argument_error(message: impl std::fmt::Display) -> ! {
+    log_error(message);
+    log_log("Use 'packit help' for usage.");
+    exit(1);
+}
 fn main() {
     let args: Vec<String> = args().collect();
-    let argc: usize = args.len();
+    let argc = args.len();
     if argc == 1 {
-        println!("Use 'help' for usage.");
-        exit(1);
+        argument_error("No command provided.");
     }
-    match &*args[1] {
+    match args[1].as_str() {
         "help" => {
-            if argc > 2 {
-                println!("Too many arguments. Use 'help' for usage.");
-                exit(1);
+            if argc != 2 {
+                argument_error("Too many arguments for 'help'.");
             }
             print_help();
             exit(0);
         }
         "version" => {
             if argc > 3 {
-                println!("Too many arguments. Use 'help' for usage.");
-                exit(1);
+                argument_error("Too many arguments for 'version'.");
             }
             if argc == 3 {
                 if args[2] == "--only-numbers" {
                     println!("{}", VERSION);
                     exit(0);
-                } else {
-                    println!("Unknown argument '{}'. Use 'help' for usage.", args[2]);
-                    exit(1);
                 }
+                argument_error(format!("Unknown version argument '{}'.", args[2]));
             }
-            println!("packit Version: {}", VERSION);
+            log_log(format!("Packit version: {}", VERSION));
             exit(0);
         }
         "init-project-local" => {
             if argc != 3 {
-                println!("Too many or less arguments. Use 'help' for usage.");
-                exit(1);
+                argument_error("'init-project-local' requires exactly one path argument.");
             }
             exit(initializer::initialize(
                 initializer::InitializeType::PROJECTLOCAL,
@@ -92,8 +92,7 @@ fn main() {
         }
         "init-tar-local" => {
             if argc != 3 {
-                println!("Too many or less arguments. Use 'help' for usage.");
-                exit(1);
+                argument_error("'init-tar-local' requires exactly one path argument.");
             }
             exit(initializer::initialize(
                 initializer::InitializeType::TARLOCAL,
@@ -102,8 +101,7 @@ fn main() {
         }
         "init-tar-remote" => {
             if argc != 3 {
-                println!("Too many or less arguments. Use 'help' for usage.");
-                exit(1);
+                argument_error("'init-tar-remote' requires exactly one URL argument.");
             }
             exit(initializer::initialize(
                 initializer::InitializeType::TARREMOTE,
@@ -112,39 +110,41 @@ fn main() {
         }
         "build" => {
             if argc != 3 {
-                println!("Too many or less arguments. Use 'help' for usage.");
-                exit(1);
+                argument_error("'build' requires exactly one manifest file argument.");
             }
             exit(builder::build(args[2].clone()));
         }
         "install" => {
             if argc != 3 {
-                println!("Too many or less arguments. Use 'help' for usage.");
-                exit(1);
+                argument_error("'install' requires exactly one package file argument.");
             }
             exit(installer::install(args[2].clone()));
         }
         "remove" => {
             if argc != 3 {
-                println!("Too many or less arguments. Use 'help' for usage.");
-                exit(1);
+                argument_error("'remove' requires exactly one package UID argument.");
             }
             exit(remover::remove(args[2].clone()));
         }
         "search" => {
-            if argc > 2 {
-                if argc > 3 {
-                    println!("Too many arguments. Use 'help' for usage.");
-                    exit(1);
-                }
+            if argc > 3 {
+                argument_error("Too many arguments for 'search'.");
+            }
+            if argc == 3 {
                 exit(finder::find(args[2].clone()));
             }
             finder::find_all();
             exit(0);
         }
-        cmd => {
-            println!("Unknown command '{}'. Use 'help' for usage.", cmd);
-            exit(1);
+        "list" => {
+            if argc != 2 {
+                argument_error("'list' does not accept arguments.");
+            }
+            finder::find_all();
+            exit(0);
+        }
+        command => {
+            argument_error(format!("Unknown command '{}'.", command));
         }
     }
 }

@@ -1,8 +1,4 @@
-pub enum InitializeType {
-    PROJECTLOCAL,
-    TARLOCAL,
-    TARREMOTE,
-}
+use crate::utils::{log_error, log_log, log_step, log_success};
 use std::{
     borrow::Cow,
     ffi::OsStr,
@@ -10,14 +6,22 @@ use std::{
     io::{Error, ErrorKind, Write},
     path::{Path, PathBuf},
 };
+pub enum InitializeType {
+    PROJECTLOCAL,
+    TARLOCAL,
+    TARREMOTE,
+}
 fn create_file(name: &str, content: &str) -> Result<String, String> {
-    let path: &Path = Path::new(name);
-    let parent: &Path = path.parent().unwrap_or(Path::new(""));
-    let stem: Cow<'_, str> = path.file_stem().unwrap().to_string_lossy();
+    let path = Path::new(name);
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let stem: Cow<'_, str> = path
+        .file_stem()
+        .ok_or_else(|| "Invalid filename.".to_string())?
+        .to_string_lossy();
     let ext: Option<Cow<'_, str>> = path.extension().map(|e: &OsStr| e.to_string_lossy());
-    let mut counter: i32 = 0;
+    let mut counter = 0;
     loop {
-        let filename: String = if counter == 0 {
+        let filename = if counter == 0 {
             name.to_string()
         } else {
             match &ext {
@@ -28,8 +32,10 @@ fn create_file(name: &str, content: &str) -> Result<String, String> {
         let filepath: PathBuf = parent.join(&filename);
         match File::options().write(true).create_new(true).open(&filepath) {
             Ok(mut file) => {
-                file.write_all(content.as_bytes())
-                    .map_err(|e: Error| e.to_string())?;
+                file.write_all(content.as_bytes()).map_err(|e: Error| {
+                    let _ = std::fs::remove_file(&filepath);
+                    e.to_string()
+                })?;
                 return Ok(filepath.to_string_lossy().to_string());
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -40,9 +46,12 @@ fn create_file(name: &str, content: &str) -> Result<String, String> {
     }
 }
 pub fn initialize(init_type: InitializeType, url: String) -> i32 {
-    let content = match init_type {
-        InitializeType::PROJECTLOCAL => format!(
-            "\
+    log_step("Initializing Packit configuration.");
+    let (package_type, content) = match init_type {
+        InitializeType::PROJECTLOCAL => (
+            "PROJECTLOCAL",
+            format!(
+                "\
 type = \"PROJECTLOCAL\"
 path = \"{}\"
 
@@ -65,10 +74,13 @@ author = [\"Example\"]
 version = \"1.0.0\"
 license = \"MIT\"
 ",
-            url
+                url
+            ),
         ),
-        InitializeType::TARLOCAL => format!(
-            "\
+        InitializeType::TARLOCAL => (
+            "TARLOCAL",
+            format!(
+                "\
 type = \"TARLOCAL\"
 path = \"{}\"
 
@@ -84,10 +96,13 @@ author = [\"Example\"]
 version = \"1.0.0\"
 license = \"MIT\"
 ",
-            url
+                url
+            ),
         ),
-        InitializeType::TARREMOTE => format!(
-            "\
+        InitializeType::TARREMOTE => (
+            "TARREMOTE",
+            format!(
+                "\
 type = \"TARREMOTE\"
 path = \"{}\"
 
@@ -103,17 +118,20 @@ author = [\"Example\"]
 version = \"1.0.0\"
 license = \"MIT\"
 ",
-            url
+                url
+            ),
         ),
     };
+    log_log(format!("Package type: {}", package_type));
+    log_step("Creating configuration file.");
     match create_file("packit-config.toml", &content) {
-        Ok(p) => {
-            println!("SUCCESS! File created in {}", p);
-            return 0;
+        Ok(path) => {
+            log_success(format!("Configuration created: '{}'.", path));
+            0
         }
         Err(e) => {
-            println!("{}", e);
-            return 1;
+            log_error(format!("Cannot create configuration: {}", e));
+            1
         }
     }
 }

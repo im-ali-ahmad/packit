@@ -137,8 +137,8 @@ fn validate_archive(archive_path: &Path) -> Result<(), String> {
         }
         count += 1;
     }
-    log(format!("Validated {} archive entries.", count));
-    log(format!("Extracted size: {} bytes.", total_size));
+    log_log(format!("Validated {} archive entries.", count));
+    log_log(format!("Extracted size: {} bytes.", total_size));
     Ok(())
 }
 fn extract_tar(archive_path: &Path, output_dir: &Path) -> Result<(), String> {
@@ -153,11 +153,14 @@ fn extract_tar(archive_path: &Path, output_dir: &Path) -> Result<(), String> {
 }
 fn read_manifest(root: &Path) -> Result<Manifest, String> {
     let path = root.join(INSTALL_MANIFEST);
-    if !path.is_file() {
-        return Err(format!(
+    let metadata = fs::symlink_metadata(&path).map_err(|_| {
+        format!(
             "Required installer manifest '{}' was not found.",
             INSTALL_MANIFEST
-        ));
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("Invalid installer manifest.".into());
     }
     let content =
         fs::read_to_string(&path).map_err(|e| format!("Cannot read installer manifest: {}", e))?;
@@ -180,7 +183,7 @@ fn verify_hash(root: &Path, expected: &str) -> Result<(), String> {
             expected, actual
         ));
     }
-    log("SHA-512 verification successful.");
+    log_success("SHA-512 verification successful.");
     Ok(())
 }
 fn validate_commands(root: &Path, manifest: &Manifest) -> Result<(), String> {
@@ -216,19 +219,22 @@ fn validate_commands(root: &Path, manifest: &Manifest) -> Result<(), String> {
 }
 fn confirm_replacement(name: &str) -> Result<bool, String> {
     let stdin = io::stdin();
-    for attempt in 1..=2 {
-        println!("[packit] Package '{}' is already installed.", name);
-        print!("[packit] Confirm replacement ({}/2). [yes??]:", attempt);
-        let mut input = String::new();
-        stdin
-            .read_line(&mut input)
-            .map_err(|e| format!("Cannot read confirmation: {}", e))?;
-        if !input.trim().eq_ignore_ascii_case("yes") {
-            log("Installation cancelled.");
-            return Ok(false);
-        }
+    println!("[packit] Package '{}' is already installed.", name);
+    print!("[packit] Confirm replacement [yes/no]: ");
+    use std::io::Write;
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Cannot flush terminal output: {}", e))?;
+    let mut input = String::new();
+    stdin
+        .read_line(&mut input)
+        .map_err(|e| format!("Cannot read confirmation: {}", e))?;
+    if input.trim().eq_ignore_ascii_case("yes") {
+        Ok(true)
+    } else {
+        log_warning("Installation cancelled.");
+        Ok(false)
     }
-    Ok(true)
 }
 fn ensure_real_directory(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
@@ -241,7 +247,9 @@ fn ensure_real_directory(path: &Path) -> Result<(), String> {
             fs::create_dir_all(path)
                 .map_err(|e| format!("Cannot create '{}': {}", path.display(), e))?;
         }
-        Err(e) => return Err(format!("Cannot inspect '{}': {}", path.display(), e)),
+        Err(e) => {
+            return Err(format!("Cannot inspect '{}': {}", path.display(), e));
+        }
     }
     Ok(())
 }
@@ -254,7 +262,6 @@ fn prepare_links(
     let mut links = Vec::new();
     for command in &manifest.commands {
         let link = bin_dir.join(&command.name);
-        let target = install_path.join(validate_relative_path(&command.file)?);
         let previous = match fs::symlink_metadata(&link) {
             Ok(metadata) => {
                 if !metadata.file_type().is_symlink() {
@@ -288,12 +295,39 @@ fn prepare_links(
                 Some(old_target)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("Cannot inspect command link: {}", e)),
+            Err(e) => {
+                return Err(format!("Cannot inspect command link: {}", e));
+            }
         };
         links.push((link, previous));
-        let _ = target;
     }
     Ok(links)
+}
+fn write_installed_manifest(install_path: &Path, manifest: &Manifest) -> Result<(), String> {
+    let now = Local::now();
+    let mut package = Package {
+        uid: manifest.project.uid.clone(),
+        name: manifest.project.name.clone(),
+        description: manifest.project.description.clone(),
+        authors: manifest.project.author.clone(),
+        version: manifest.project.version.clone(),
+        license: manifest.project.license.clone(),
+        files: Vec::new(),
+        install_date: (now.day() as u8, now.month() as u8, now.year() as u16),
+    };
+    for entry in WalkDir::new(install_path).follow_links(false) {
+        let entry = entry.map_err(|e| format!("Cannot walk installation directory: {}", e))?;
+        if entry.file_type().is_file() {
+            package
+                .files
+                .push(entry.path().to_string_lossy().to_string());
+        }
+    }
+    let content = toml::to_string_pretty(&package)
+        .map_err(|e| format!("Cannot serialize installed manifest: {}", e))?;
+    fs::write(install_path.join(INSTALL_MANIFEST), content)
+        .map_err(|e| format!("Cannot write installed manifest: {}", e))?;
+    Ok(())
 }
 fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> Result<(), String> {
     let archive_size = fs::metadata(archive_path)
@@ -312,9 +346,9 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
     extract_tar(archive_path, temp_dir.path())?;
     log_step("Reading installer manifest.");
     let manifest = read_manifest(temp_dir.path())?;
-    log(format!("Package: {}", manifest.project.name));
-    log(format!("Version: {}", manifest.project.version));
-    log(format!("UID: {}", manifest.project.uid));
+    log_log(format!("Package: {}", manifest.project.name));
+    log_log(format!("Version: {}", manifest.project.version));
+    log_log(format!("UID: {}", manifest.project.uid));
     verify_hash(temp_dir.path(), &manifest.hash)?;
     validate_commands(temp_dir.path(), &manifest)?;
     let install_path = install_root.join(&manifest.project.uid);
@@ -329,7 +363,9 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
             true
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(format!("Cannot inspect installation: {}", e)),
+        Err(e) => {
+            return Err(format!("Cannot inspect installation: {}", e));
+        }
     };
     if old_install && !confirm_replacement(&manifest.project.name)? {
         return Err("Installation cancelled.".into());
@@ -361,22 +397,22 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
     let mut created_links = Vec::new();
     let mut removed_links = Vec::new();
     let result = (|| -> Result<(), String> {
-        if let Err(e) = fs::rename(&staging_path, &install_path) {
-            return Err(format!("Cannot activate installation: {}", e));
-        }
+        fs::rename(&staging_path, &install_path)
+            .map_err(|e| format!("Cannot activate installation: {}", e))?;
         for (link, previous) in &links {
             if previous.is_some() {
                 fs::remove_file(link).map_err(|e| format!("Cannot replace command link: {}", e))?;
                 removed_links.push((link.clone(), previous.clone()));
             }
-            let relative = manifest
+            let command = manifest
                 .commands
                 .iter()
                 .find(|command| bin_dir.join(&command.name) == *link)
                 .ok_or_else(|| "Cannot resolve command link.".to_string())?;
-            let target = install_path.join(validate_relative_path(&relative.file)?);
+            let target = install_path.join(validate_relative_path(&command.file)?);
             symlink(&target, link)
                 .map_err(|e| format!("Cannot create command link '{}': {}", link.display(), e))?;
+            created_links.push(link.clone());
             fs::set_permissions(&target, Permissions::from_mode(0o755)).map_err(|e| {
                 format!(
                     "Cannot set executable permissions on '{}': {}",
@@ -384,8 +420,9 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
                     e
                 )
             })?;
-            created_links.push(link.clone());
         }
+        log_step("Installing manifest.");
+        write_installed_manifest(&install_path, &manifest)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -405,47 +442,21 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
         return Err(format!("Installation failed: {}", error));
     }
     if let Some(backup) = backup_dir {
-        fs::remove_dir_all(&backup).map_err(|e| {
-            format!(
-                "Installed successfully, but cannot remove backup '{}': {}",
+        if let Err(e) = fs::remove_dir_all(&backup) {
+            log_warning(format!(
+                "Installation succeeded, but backup '{}' could not be removed: {}",
                 backup.display(),
                 e
-            )
-        })?;
-    }
-    log_step("Installing manifest...");
-    let manifest_path = install_path.join(INSTALL_MANIFEST);
-    let now = Local::now();
-    let day = now.day() as u8;
-    let month = now.month() as u8;
-    let year = now.year() as u16;
-    let mut package = Package {
-        uid: manifest.project.uid,
-        name: manifest.project.name,
-        description: manifest.project.description,
-        authors: manifest.project.author.clone(),
-        version: manifest.project.version,
-        license: manifest.project.license,
-        files: Vec::new(),
-        install_date: (day, month, year),
-    };
-    for entry in WalkDir::new(&*install_path) {
-        let entry = entry.map_err(|e| format!("Cannot walk installation directory: {}", e))?;
-        let path = entry.path();
-        if path.is_file() {
-            package.files.push(path.to_string_lossy().to_string());
+            ));
         }
     }
-    let manifest_content = toml::to_string_pretty(&package)
-        .map_err(|e| format!("Cannot serialize installed manifest: {}", e))?;
-    fs::write(&manifest_path, manifest_content)
-        .map_err(|e| format!("Cannot write installed manifest: {}", e))?;
-    log_step("Installation completed successfully.");
-    log(format!("Installed at: {}", install_path.display()));
-    log(format!("Commands linked in: {}", bin_dir.display()));
+    log_success("Installation completed successfully.");
+    log_log(format!("Installed at: {}", install_path.display()));
+    log_log(format!("Commands linked in: {}", bin_dir.display()));
     Ok(())
 }
 pub fn install(path: String) -> i32 {
+    log_step("Starting package installation.");
     let result = (|| -> Result<(), String> {
         let archive_path = Path::new(&path)
             .canonicalize()
@@ -461,10 +472,12 @@ pub fn install(path: String) -> i32 {
         install_package(&archive_path, &install_root, &bin_dir)
     })();
     match result {
-        Ok(()) => 0,
+        Ok(()) => {
+            log_success("Package installation completed.");
+            0
+        }
         Err(error) => {
-            log_step("Installation failed.");
-            log(error);
+            log_error(format!("Installation failed: {}", error));
             1
         }
     }
