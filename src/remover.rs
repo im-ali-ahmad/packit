@@ -6,38 +6,43 @@ use std::{
     io::{self, Write},
     path::{Component, Path, PathBuf},
 };
-fn is_safe_install_path(path: &Path, install_root: &Path) -> bool {
-    if !path.is_absolute()
-        || !path.starts_with(install_root)
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return false;
-    }
-    let mut current = install_root.to_path_buf();
-    if let Ok(metadata) = fs::symlink_metadata(&current) {
-        if metadata.file_type().is_symlink() {
-            return false;
+fn is_safe_install_path(path: &Path, safe_roots: &[PathBuf]) -> bool {
+    for install_root in safe_roots {
+        if !path.is_absolute()
+            || !path.starts_with(install_root)
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            continue;
         }
-    }
-    let relative = match path.strip_prefix(install_root) {
-        Ok(relative) => relative,
-        Err(_) => return false,
-    };
-    let mut components = relative.components().peekable();
-    while let Some(component) = components.next() {
-        current.push(component);
-        if components.peek().is_some() {
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => return false,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => return false,
-                _ => {}
+        let mut current = install_root.to_path_buf();
+        if let Ok(metadata) = fs::symlink_metadata(&current) {
+            if metadata.file_type().is_symlink() {
+                continue;
             }
         }
+        let relative = match path.strip_prefix(install_root) {
+            Ok(relative) => relative,
+            Err(_) => continue,
+        };
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            current.push(component);
+            if components.peek().is_some() {
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return false;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => return false,
+                    _ => {}
+                }
+            }
+        }
+        return true;
     }
-    true
+    false
 }
 pub fn remove(package: String) -> i32 {
     let pack = match find_raw(package) {
@@ -86,12 +91,13 @@ pub fn remove(package: String) -> i32 {
         return 1;
     }
     let install_root = home.join(".local/packit.opt").join(uid);
+    let safe_roots = [install_root.clone(), home.join(".local/bin")];
     log_step(format!("Removing package '{}'...", pack.uid));
     let mut success = true;
     let mut directories = BTreeSet::new();
     for filename in &pack.files {
         let path = Path::new(filename);
-        if !is_safe_install_path(path, &install_root) {
+        if !is_safe_install_path(path, &safe_roots) {
             log_warning(format!("Skipping invalid installation path: {}", filename));
             success = false;
             continue;
