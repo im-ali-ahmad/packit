@@ -2,7 +2,8 @@ use crate::finder::find_raw;
 use crate::utils::*;
 use std::{
     collections::BTreeSet,
-    env, fs, io,
+    env, fs,
+    io::{self, Write},
     path::{Component, Path, PathBuf},
 };
 fn is_safe_install_path(path: &Path, install_root: &Path) -> bool {
@@ -53,20 +54,21 @@ pub fn remove(package: String) -> i32 {
         "Install Date: {:02}/{:02}/{:04}",
         pack.install_date.0, pack.install_date.1, pack.install_date.2
     );
-    let stdin = io::stdin();
     for attempt in 1..=2 {
-        log_warning(format!(
-            "Confirm removal ({}/2). Type 'yes' to continue:",
-            attempt
-        ));
+        print!("Confirmation ({}/2) to remove [yes]: ", attempt);
+        let _ = io::stdout().flush();
         let mut input = String::new();
-        if let Err(error) = stdin.read_line(&mut input) {
-            log_error(format!("Cannot read confirmation: {}", error));
-            return 1;
-        }
-        if !input.trim().eq_ignore_ascii_case("yes") {
-            log_warning("Removal cancelled.");
-            return 1;
+        match io::stdin().read_line(&mut input) {
+            Ok(_) => {
+                if !input.trim().eq_ignore_ascii_case("yes") {
+                    log_warning("Removal cancelled.");
+                    return 1;
+                }
+            }
+            Err(e) => {
+                log_error(format!("Cannot read confirmation: {}", e));
+                return 1;
+            }
         }
     }
     let home = match env::var_os("HOME") {
@@ -104,9 +106,7 @@ pub fn remove(package: String) -> i32 {
             }
         }
         match fs::remove_file(path) {
-            Ok(()) => {
-                log_success(format!("Removed: {}", filename));
-            }
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 log_warning(format!("Already missing: {}", filename));
             }
@@ -118,9 +118,7 @@ pub fn remove(package: String) -> i32 {
     }
     for directory in directories.iter().rev() {
         match fs::remove_dir(directory) {
-            Ok(()) => {
-                log_success(format!("Removed empty directory: {}", directory.display()));
-            }
+            Ok(()) => {}
             Err(error)
                 if error.kind() == io::ErrorKind::DirectoryNotEmpty
                     || error.kind() == io::ErrorKind::NotFound => {}

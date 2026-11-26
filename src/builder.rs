@@ -918,7 +918,9 @@ pub fn build(path: String) -> (i32, Option<PathBuf>) {
         if let Some(prebuild) = &manifest.prebuild {
             match run_prebuild_command(prebuild, &manifest_file_path) {
                 Ok(_) => log_success("Ran prebuild command successfully."),
-                Err(e) => log_error(e),
+                Err(e) => {
+                    return Err(e);
+                }
             };
         }
         match manifest.r#type.as_str() {
