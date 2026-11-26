@@ -307,7 +307,11 @@ fn prepare_links(
     }
     Ok(links)
 }
-fn write_installed_manifest(install_path: &Path, manifest: &Manifest) -> Result<(), String> {
+fn write_installed_manifest(
+    install_path: &Path,
+    bin_dir: &Path,
+    manifest: &Manifest,
+) -> Result<(), String> {
     let now = Local::now();
     let mut package = Package {
         uid: manifest.project.uid.clone(),
@@ -326,6 +330,11 @@ fn write_installed_manifest(install_path: &Path, manifest: &Manifest) -> Result<
                 .files
                 .push(entry.path().to_string_lossy().to_string());
         }
+    }
+    for command in &manifest.commands {
+        package
+            .files
+            .push(bin_dir.join(&command.name).to_string_lossy().to_string());
     }
     let content = toml::to_string_pretty(&package)
         .map_err(|e| format!("Cannot serialize installed manifest: {}", e))?;
@@ -426,7 +435,7 @@ fn install_package(archive_path: &Path, install_root: &Path, bin_dir: &Path) -> 
             })?;
         }
         log_step("Installing manifest.");
-        write_installed_manifest(&install_path, &manifest)?;
+        write_installed_manifest(&install_path, bin_dir, &manifest)?;
         Ok(())
     })();
     if let Err(error) = result {
