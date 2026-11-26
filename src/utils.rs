@@ -90,7 +90,7 @@ pub fn progress(what: &str, percent: u8) {
     let filled = (bar_width * percent as usize) / 100;
     let empty = bar_width - filled;
     print!(
-        "\r\x1b[2K{} [{}{}] {:>3}%",
+        "\r\x1b[2K{} {}{} {:>3}%",
         what,
         "▮".repeat(filled),
         "▯".repeat(empty),

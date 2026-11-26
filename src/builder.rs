@@ -214,15 +214,9 @@ fn copy_dir_content(src: &Path, dest: &Path) -> Result<(), String> {
         let relative = path.strip_prefix(&src).map_err(|e| e.to_string())?;
         let destination = dest_absolute.join(relative);
         let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "Symbolic links are not supported: '{}'.",
-                path.display()
-            ));
-        }
         if metadata.is_dir() {
             directories.push(destination);
-        } else if metadata.is_file() {
+        } else if metadata.is_file() || metadata.file_type().is_symlink() {
             files.push((path.to_path_buf(), destination, metadata.len()));
         } else {
             return Err(format!("Unsupported file type: '{}'.", path.display()));
@@ -628,15 +622,6 @@ fn validate_archive(archive: &mut Archive<GzDecoder<File>>) -> Result<u64, Strin
             }
         }
         let kind = entry.header().entry_type();
-        if kind.is_symlink() || kind.is_hard_link() {
-            return Err(format!(
-                "Archive links are not supported: '{}'.",
-                path.display()
-            ));
-        }
-        if !kind.is_file() && !kind.is_dir() {
-            return Err(format!("Unsupported archive entry '{}'.", path.display()));
-        }
         if kind.is_file() {
             let size = entry
                 .header()
@@ -923,7 +908,6 @@ fn run_prebuild_command(cmd: &String, manifest_file_path: &Path) -> Result<(), S
     if !status.success() {
         return Err(format!("Command exited with error: {}", status));
     }
-
     Ok(())
 }
 pub fn build(path: String) -> (i32, Option<PathBuf>) {
