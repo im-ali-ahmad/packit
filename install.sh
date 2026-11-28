@@ -3,16 +3,16 @@ set -Eeuo pipefail
 EXECUTABLE_URL="https://github.com/im-ali-ahmad/packit/releases/latest/download"
 
 ARCH=$(uname -m)
-case "$ARCH" in
+case "$ARCH" in #(
   x86_64|amd64)
     EXECUTABLE_URL="$EXECUTABLE_URL/packit-x86_64-linux"
-    ;;
+    ;;          #(
   aarch64|arm64|armv8*)
     EXECUTABLE_URL="$EXECUTABLE_URL/packit-arm64-linux"
-    ;;
+    ;;          #(
   armv7*|armhf)
     EXECUTABLE_URL="$EXECUTABLE_URL/packit-armhf-linux"
-    ;;
+    ;;          #(
   *)
     echo "Unsupported architecture: $ARCH"
     exit 1
@@ -50,8 +50,7 @@ version = "$VERSION"
 license = "MIT"
 EOF
 
-./packit build packit-config.toml
-./packit install packit.cli-$VERSION.pack
+./packit build packit-config.toml --install
 
 cd -
 rm -rf tmp-install-packit
